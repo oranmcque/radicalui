@@ -1,0 +1,6 @@
+{
+  "name": "Aetheris WebUI",
+  "description": "Self-hosted AI workspace with Mnemosyne OS persistent memory, multi-provider LLM routing (Gemini, OpenAI, DeepSeek, NanoGPT), Deepgram & Fish Audio voice pipelines, and real-time multimodal Live Call.",
+  "requestFramePermissions": ["microphone", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
