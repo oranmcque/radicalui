@@ -1,44 +1,68 @@
+import adapter from '@sveltejs/adapter-static';
+import { sveltekit } from '@sveltejs/kit/vite';
 import tailwindcss from '@tailwindcss/vite';
-import react from '@vitejs/plugin-react';
-import fs from 'fs';
-import path from 'path';
-import {defineConfig} from 'vite';
+import { defineConfig, type Plugin } from 'vite';
 
-export default defineConfig(() => {
+/**
+ * Prevents SvelteKit's client fetcher.js from throwing
+ * `TypeError: Cannot set property fetch of #<Window> which has only a getter`
+ * when hosted inside sandboxed iframes that define `window.fetch` via a getter.
+ */
+function safeSvelteKitFetchPlugin(): Plugin {
   return {
-    plugins: [
-      react(),
-      tailwindcss(),
-      // Copies src/assets into dist/ so root-relative URLs like
-      // "/src/assets/images/..." (e.g. generate_image output) still resolve
-      // in production builds. Do not remove.
-      {
-        name: 'copy-unbundled-src-assets',
-        apply: 'build',
-        closeBundle(error?: Error): void {
-          if (error) {
-            return;
-          }
-          const distDir = path.resolve(__dirname, 'dist');
-          const srcAssets = path.resolve(__dirname, 'src/assets');
-          const distAssets = path.resolve(distDir, 'src/assets');
-          if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
-            fs.cpSync(srcAssets, distAssets, {recursive: true, force: true});
-          }
-        },
-      },
-    ],
-    resolve: {
-      alias: {
-        '@': path.resolve(__dirname, '.'),
-      },
-    },
-    server: {
-      // HMR is disabled in AI Studio via DISABLE_HMR env var.
-      // Do not modify—file watching is disabled to prevent flickering during agent edits.
-      hmr: process.env.DISABLE_HMR !== 'true',
-      // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
-      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+    name: 'safe-sveltekit-fetch',
+    enforce: 'pre',
+    transform(code, id) {
+      const normalized = id.replace(/\\/g, '/');
+      if (!normalized.includes('@sveltejs/kit/src/runtime/client/fetcher.js')) {
+        return null;
+      }
+      if (!/window\.fetch\s*=/.test(code)) {
+        return null;
+      }
+      const patched =
+        `let __sveltekit_safe_fetch;\n` +
+        code
+          .replace(/window\.fetch\s*=/g, '__sveltekit_safe_fetch =')
+          .replace(
+            'const cache = new Map();',
+            `if (typeof __sveltekit_safe_fetch === 'function') {
+  try {
+    let target = window;
+    let desc = Object.getOwnPropertyDescriptor(target, 'fetch');
+    while (!desc && target) {
+      target = Object.getPrototypeOf(target);
+      if (target) desc = Object.getOwnPropertyDescriptor(target, 'fetch');
+    }
+    if (!desc || desc.writable || typeof desc.set === 'function') {
+      window.fetch = __sveltekit_safe_fetch;
+    }
+  } catch {
+    // Keep host-provided getter-only window.fetch intact
+  }
+}
+const cache = new Map();`
+          );
+      return { code: patched, map: null };
     },
   };
+}
+
+export default defineConfig({
+  plugins: [
+    safeSvelteKitFetchPlugin(),
+    tailwindcss(),
+    sveltekit({
+      adapter: adapter({
+        pages: 'dist',
+        assets: 'dist',
+        fallback: 'index.html',
+        strict: false,
+      }),
+    }),
+  ],
+  server: {
+    hmr: false,
+    watch: null,
+  },
 });

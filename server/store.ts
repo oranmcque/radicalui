@@ -1,5 +1,3 @@
-import fs from 'fs';
-import path from 'path';
 import crypto from 'crypto';
 import type {
   AppStatePayload,
@@ -13,9 +11,12 @@ import type {
   VaultDocument,
   WorkspaceSettings,
 } from '../src/types/index.js';
-
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const STORE_PATH = path.join(DATA_DIR, 'aetheris-store.json');
+import {
+  DEFAULT_STORE_FILE,
+  readLocalOrMountedStoreRaw,
+  writeFileAtomic,
+  writeStoreRaw,
+} from './storage.js';
 
 const DEFAULT_SETTINGS: WorkspaceSettings = {
   activeProvider: 'gemini',
@@ -28,12 +29,27 @@ const DEFAULT_SETTINGS: WorkspaceSettings = {
   deepgramTtsVoice: 'aura-asteria-en',
   geminiVoice: 'Zephyr',
   systemPrompt:
-    'You are Aetheris, a self-hosted multimodal intelligence running inside Mnemosyne OS. Be direct, technically rigorous, and leverage recalled memories naturally without reciting memory IDs unless asked.',
+    'You are Pheonikz UI, a self-hosted multimodal intelligence running inside Mnemosyne OS. Be direct, technically rigorous, and leverage recalled memories naturally without reciting memory IDs unless asked.',
   autoConsolidateMemory: true,
   useMnemosyneInChat: true,
+  useWebSearchInChat: true,
+  searchProvider: 'gemini-native',
+  searxngBaseUrl: process.env.SEARXNG_BASE_URL || 'http://localhost:8888',
+  customSearchUrl: process.env.CUSTOM_SEARCH_URL || '',
+  customSearchMethod: 'GET',
+  maxSearchResults: Math.min(20, Math.max(1, Number(process.env.MAX_SEARCH_RESULTS) || 5)),
 };
 
-export type VaultKeyProvider = 'deepgram' | 'fishaudio' | 'nanogpt' | 'deepseek' | 'openai';
+export type VaultKeyProvider =
+  | 'deepgram'
+  | 'fishaudio'
+  | 'nanogpt'
+  | 'deepseek'
+  | 'openai'
+  | 'parallel'
+  | 'brave'
+  | 'tavily'
+  | 'custom_search';
 
 interface PersistedStore extends AppStatePayload {
   providerKeys?: Partial<Record<VaultKeyProvider, string>>;
@@ -76,29 +92,30 @@ function createInitialState(): PersistedStore {
 
 let cachedState: PersistedStore | null = null;
 
-function ensureDataDir() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+function parseStoreJson(raw: string): PersistedStore | null {
+  try {
+    const parsed = JSON.parse(raw) as Partial<PersistedStore>;
+    if (!parsed || typeof parsed !== 'object') return null;
+    return {
+      threads: Array.isArray(parsed.threads) ? parsed.threads : [],
+      memories: Array.isArray(parsed.memories) ? parsed.memories : [],
+      vaultDocs: Array.isArray(parsed.vaultDocs) ? parsed.vaultDocs : [],
+      settings: { ...DEFAULT_SETTINGS, ...(parsed.settings ?? {}) },
+      providerKeys: parsed.providerKeys ?? {},
+    };
+  } catch {
+    return null;
   }
 }
 
 export function loadState(): PersistedStore {
   if (cachedState) return cachedState;
-  ensureDataDir();
-  if (fs.existsSync(STORE_PATH)) {
-    try {
-      const raw = fs.readFileSync(STORE_PATH, 'utf-8');
-      const parsed = JSON.parse(raw) as Partial<PersistedStore>;
-      cachedState = {
-        threads: parsed.threads ?? [],
-        memories: parsed.memories ?? [],
-        vaultDocs: parsed.vaultDocs ?? [],
-        settings: { ...DEFAULT_SETTINGS, ...(parsed.settings ?? {}) },
-        providerKeys: parsed.providerKeys ?? {},
-      };
+  const { raw } = readLocalOrMountedStoreRaw();
+  if (raw) {
+    const parsed = parseStoreJson(raw);
+    if (parsed) {
+      cachedState = parsed;
       return cachedState;
-    } catch {
-      // Fallback to fresh store if corrupted
     }
   }
   cachedState = createInitialState();
@@ -108,8 +125,26 @@ export function loadState(): PersistedStore {
 
 export function saveState(state: PersistedStore): void {
   cachedState = state;
-  ensureDataDir();
-  fs.writeFileSync(STORE_PATH, JSON.stringify(state, null, 2), 'utf-8');
+  writeStoreRaw(JSON.stringify(state, null, 2));
+}
+
+export function exportSerializedState(): string {
+  return JSON.stringify(loadState(), null, 2);
+}
+
+export function reloadStateFromStorage(): PersistedStore {
+  cachedState = null;
+  return loadState();
+}
+
+export function replaceStateFromRawJson(raw: string): PersistedStore {
+  const parsed = parseStoreJson(raw);
+  if (!parsed) {
+    throw new Error('Pulled remote data is not a valid Pheonikz UI / Mnemosyne store.');
+  }
+  cachedState = parsed;
+  writeFileAtomic(DEFAULT_STORE_FILE, JSON.stringify(parsed, null, 2));
+  return parsed;
 }
 
 const ENV_MAP: Record<VaultKeyProvider, string> = {
@@ -118,6 +153,10 @@ const ENV_MAP: Record<VaultKeyProvider, string> = {
   nanogpt: 'NANOGPT_API_KEY',
   deepseek: 'DEEPSEEK_API_KEY',
   openai: 'OPENAI_API_KEY',
+  parallel: 'PARALLEL_API_KEY',
+  brave: 'BRAVE_API_KEY',
+  tavily: 'TAVILY_API_KEY',
+  custom_search: 'CUSTOM_SEARCH_API_KEY',
 };
 
 export function resolveProviderKey(provider: VaultKeyProvider): {
@@ -484,7 +523,20 @@ export function deleteVaultDocument(id: string): boolean {
 
 export function updateSettings(updates: Partial<WorkspaceSettings>): WorkspaceSettings {
   const state = loadState();
-  state.settings = { ...state.settings, ...updates };
+  const next: WorkspaceSettings = { ...state.settings, ...updates };
+  if (typeof updates.maxSearchResults === 'number' && Number.isFinite(updates.maxSearchResults)) {
+    next.maxSearchResults = Math.min(20, Math.max(1, Math.round(updates.maxSearchResults)));
+  }
+  if (typeof updates.searxngBaseUrl === 'string') {
+    next.searxngBaseUrl = updates.searxngBaseUrl.trim() || 'http://localhost:8888';
+  }
+  if (typeof updates.customSearchUrl === 'string') {
+    next.customSearchUrl = updates.customSearchUrl.trim();
+  }
+  if (updates.customSearchMethod !== undefined) {
+    next.customSearchMethod = updates.customSearchMethod === 'POST' ? 'POST' : 'GET';
+  }
+  state.settings = next;
   saveState(state);
   return state.settings;
 }

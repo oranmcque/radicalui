@@ -1,28 +1,27 @@
 {
+  "extends": "$app/tsconfig",
   "compilerOptions": {
-    "target": "ES2022",
-    "experimentalDecorators": true,
-    "useDefineForClassFields": false,
-    "module": "ESNext",
-    "types": ["vite/client"],
-    "lib": [
-      "ES2022",
-      "DOM",
-      "DOM.Iterable"
-    ],
-    "skipLibCheck": true,
-    "moduleResolution": "bundler",
-    "isolatedModules": true,
-    "moduleDetection": "force",
     "allowJs": true,
-    "jsx": "react-jsx",
-    "paths": {
-      "@/*": [
-        "./*"
-      ]
-    },
+    "checkJs": false,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "sourceMap": true,
+    "strict": true,
+    "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
-    "noEmit": true
+    "noEmit": true,
+    "paths": {
+      "#lib/*": ["./src/lib/*"]
+    }
   },
-  "exclude": ["dist"]
+  "include": [
+    "src/**/*.js",
+    "src/**/*.ts",
+    "src/**/*.svelte",
+    "server.ts",
+    "server/**/*.ts"
+  ],
+  "exclude": ["dist", "node_modules", "src/service-worker"]
 }

@@ -2,12 +2,13 @@ import type { IncomingMessage } from 'http';
 import type { Duplex } from 'stream';
 import { WebSocket, WebSocketServer } from 'ws';
 import {
-  FunctionDeclaration,
-  LiveServerMessage,
+  type FunctionDeclaration,
+  type LiveServerMessage,
   Modality,
   Type,
 } from '@google/genai';
 import { getGeminiClient } from './ai.js';
+import { executeWebReconSearch } from './search.js';
 import {
   addMemory,
   formatMnemosyneSystemBlock,
@@ -49,6 +50,22 @@ const saveMemoryDecl: FunctionDeclaration = {
       },
     },
     required: ['tier', 'content'],
+  },
+};
+
+const searchInternetDecl: FunctionDeclaration = {
+  name: 'search_internet',
+  description:
+    'Searches the live internet via Parallel Search MCP for up-to-date facts, news, documentation, or current events.',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      query: {
+        type: Type.STRING,
+        description: 'Clear search question or topic to look up on the internet.',
+      },
+    },
+    required: ['query'],
   },
 };
 
@@ -136,14 +153,22 @@ export function attachWebSocketServers(server: {
           },
           inputAudioTranscription: {},
           outputAudioTranscription: {},
-          tools: [{ functionDeclarations: [recallMemoryDecl, saveMemoryDecl] }],
+          tools: [
+            {
+              functionDeclarations: [
+                recallMemoryDecl,
+                saveMemoryDecl,
+                searchInternetDecl,
+              ],
+            },
+          ],
           systemInstruction,
         },
         callbacks: {
           onopen: () => {
             sendSafe({ type: 'ready', model: 'gemini-3.8-live' });
           },
-          onmessage: (message: LiveServerMessage) => {
+          onmessage: async (message: LiveServerMessage) => {
             const serverContent = message.serverContent;
             if (serverContent?.inputTranscription?.text) {
               sendSafe({
@@ -222,6 +247,46 @@ export function attachWebSocketServers(server: {
                     },
                   ],
                 });
+              } else if (call.name === 'search_internet') {
+                const q = (args.query || '').trim();
+                try {
+                  const searchRes = await executeWebReconSearch({ query: q });
+                  sendSafe({
+                    type: 'mnemosyne_event',
+                    action: 'search',
+                    query: q,
+                    resultsCount: searchRes.results.length,
+                  });
+                  session?.sendToolResponse({
+                    functionResponses: [
+                      {
+                        id: call.id,
+                        name: call.name,
+                        response: {
+                          results: searchRes.results.slice(0, 5).map((r) => ({
+                            title: r.title,
+                            url: r.url,
+                            publishDate: r.publishDate,
+                            excerpt: r.excerpt.slice(0, 600),
+                          })),
+                        },
+                      },
+                    ],
+                  });
+                } catch (err) {
+                  session?.sendToolResponse({
+                    functionResponses: [
+                      {
+                        id: call.id,
+                        name: call.name,
+                        response: {
+                          error:
+                            err instanceof Error ? err.message : 'Internet search unavailable',
+                        },
+                      },
+                    ],
+                  });
+                }
               }
             }
           },

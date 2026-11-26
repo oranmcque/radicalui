@@ -1,0 +1,18 @@
+{
+	"/": [
+		"src/routes/+layout.ts",
+		"src/routes/+layout.ts"
+	],
+	"/live": [
+		"src/routes/+layout.ts"
+	],
+	"/mnemosyne": [
+		"src/routes/+layout.ts"
+	],
+	"/search": [
+		"src/routes/+layout.ts"
+	],
+	"/vault": [
+		"src/routes/+layout.ts"
+	]
+}

@@ -3,7 +3,8 @@ import express from 'express';
 import http from 'http';
 import path from 'path';
 import crypto from 'crypto';
-import { createServer as createViteServer } from 'vite';
+import type { ViteDevServer } from 'vite';
+import fs from 'fs';
 import type {
   ChatAttachment,
   ChatMessage,
@@ -11,7 +12,10 @@ import type {
   MemoryTier,
   MnemosyneMemory,
   STTProvider,
+  SearchProvider,
+  StorageMode,
   TTSProvider,
+  WebSearchSource,
 } from './src/types/index.js';
 import {
   MODEL_CATALOG,
@@ -21,6 +25,23 @@ import {
   synthesizeSpeech,
   transcribeAudio,
 } from './server/ai.js';
+import {
+  executeWebReconSearch,
+  formatWebSearchSystemBlock,
+  parallelWebFetch,
+  testSearchProviderConnection,
+} from './server/search.js';
+import {
+  getPublicStorageConfig,
+  loadStorageConfig,
+  persistStorageConfig,
+  pullStoreFromRemote,
+  pushStoreToRemote,
+  testStorageConnection,
+  validateMountedPath,
+  validateRemoteStorageUrl,
+  writeFileAtomic,
+} from './server/storage.js';
 import { attachWebSocketServers } from './server/live.js';
 import {
   addMemory,
@@ -30,11 +51,14 @@ import {
   deleteMemory,
   deleteThread,
   deleteVaultDocument,
+  exportSerializedState,
   formatMnemosyneSystemBlock,
   getPublicAppState,
   getThread,
   loadState,
   recallMnemosyneContext,
+  reloadStateFromStorage,
+  replaceStateFromRawJson,
   setProviderKey,
   updateMemory,
   updateSettings,
@@ -70,6 +94,10 @@ async function startServer() {
       'nanogpt',
       'deepseek',
       'openai',
+      'parallel',
+      'brave',
+      'tavily',
+      'custom_search',
     ];
     if (!allowed.includes(provider)) {
       res.status(400).json({ error: 'Unsupported credential slot.' });
@@ -91,6 +119,261 @@ async function startServer() {
   app.patch('/api/settings', (req, res) => {
     const updated = updateSettings(req.body ?? {});
     res.json(updated);
+  });
+
+  // Persistent Storage Backend (Local, Mounted Hetzner Storage Box, WebDAV, External HTTP)
+  app.get('/api/storage/config', (_req, res) => {
+    res.json(getPublicStorageConfig());
+  });
+
+  app.post('/api/storage/test', async (req, res) => {
+    try {
+      const result = await testStorageConnection(req.body ?? {});
+      res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        message: err instanceof Error ? err.message : 'Storage test failed',
+      });
+    }
+  });
+
+  app.post('/api/storage/config', async (req, res) => {
+    try {
+      const body = (req.body ?? {}) as {
+        mode?: StorageMode;
+        mountedPath?: string;
+        remoteUrl?: string;
+        remoteUsername?: string;
+        remotePassword?: string;
+        clearRemotePassword?: boolean;
+        remoteToken?: string;
+        clearRemoteToken?: boolean;
+        remoteMethod?: 'PUT' | 'POST';
+        autoSyncRemote?: boolean;
+        migrateData?: boolean;
+        preferExistingOnTarget?: boolean;
+      };
+
+      const prev = loadStorageConfig();
+      const nextMode: StorageMode =
+        body.mode === 'mounted' ||
+        body.mode === 'webdav' ||
+        body.mode === 'remote-http' ||
+        body.mode === 'local'
+          ? body.mode
+          : prev.mode;
+
+      const nextMountedPath =
+        body.mountedPath !== undefined ? body.mountedPath.trim() : prev.mountedPath;
+      const nextRemoteUrl =
+        body.remoteUrl !== undefined ? body.remoteUrl.trim() : prev.remoteUrl;
+
+      if (nextMode === 'mounted') {
+        const check = validateMountedPath(nextMountedPath);
+        if (!check.ok) {
+          res.status(400).json({ error: check.error });
+          return;
+        }
+      } else if (nextMode === 'webdav' || nextMode === 'remote-http') {
+        const check = validateRemoteStorageUrl(nextRemoteUrl);
+        if (!check.ok) {
+          res.status(400).json({ error: check.error });
+          return;
+        }
+      }
+
+      // Capture current in-memory state before switching targets
+      const currentSnapshot = exportSerializedState();
+
+      const nextConfig = {
+        ...prev,
+        mode: nextMode,
+        mountedPath: nextMountedPath,
+        remoteUrl: nextRemoteUrl,
+        remoteUsername:
+          body.remoteUsername !== undefined ? body.remoteUsername.trim() : prev.remoteUsername,
+        remotePassword: body.clearRemotePassword
+          ? ''
+          : body.remotePassword && body.remotePassword.trim()
+            ? body.remotePassword
+            : prev.remotePassword,
+        remoteToken: body.clearRemoteToken
+          ? ''
+          : body.remoteToken && body.remoteToken.trim()
+            ? body.remoteToken.trim()
+            : prev.remoteToken,
+        remoteMethod:
+          body.remoteMethod === 'POST' || body.remoteMethod === 'PUT'
+            ? body.remoteMethod
+            : prev.remoteMethod,
+        autoSyncRemote:
+          typeof body.autoSyncRemote === 'boolean' ? body.autoSyncRemote : prev.autoSyncRemote,
+        lastSyncError: null as string | null,
+      };
+
+      let notice = `Storage backend switched to ${nextMode.toUpperCase()}.`;
+
+      if (nextMode === 'mounted') {
+        const check = validateMountedPath(nextConfig.mountedPath);
+        if (check.ok) {
+          const targetExists = fs.existsSync(check.resolvedFile);
+          if (body.preferExistingOnTarget && targetExists) {
+            persistStorageConfig(nextConfig);
+            reloadStateFromStorage();
+            notice = `Loaded existing Mnemosyne & UI store from ${check.resolvedFile}.`;
+          } else {
+            if (body.migrateData !== false || !targetExists) {
+              writeFileAtomic(check.resolvedFile, currentSnapshot);
+              nextConfig.lastSyncedAt = new Date().toISOString();
+            }
+            persistStorageConfig(nextConfig);
+            reloadStateFromStorage();
+            notice = `Migrated & locked all Mnemosyne + UI storage to ${check.resolvedFile}.`;
+          }
+        }
+      } else if (nextMode === 'webdav' || nextMode === 'remote-http') {
+        persistStorageConfig(nextConfig);
+        if (body.preferExistingOnTarget) {
+          const pulled = await pullStoreFromRemote(nextConfig);
+          if (pulled.ok) {
+            replaceStateFromRawJson(pulled.raw);
+            nextConfig.lastSyncedAt = new Date().toISOString();
+            nextConfig.lastSyncError = null;
+            persistStorageConfig(nextConfig);
+            notice = `Loaded existing Mnemosyne & UI store from ${nextMode.toUpperCase()}.`;
+          } else {
+            // If no remote store exists yet, push current snapshot if migrateData is enabled
+            if (body.migrateData !== false) {
+              const pushed = await pushStoreToRemote(currentSnapshot, nextConfig);
+              if (!pushed.ok) {
+                nextConfig.lastSyncError = pushed.message;
+                persistStorageConfig(nextConfig);
+                res.status(400).json({ error: pushed.message, config: getPublicStorageConfig() });
+                return;
+              }
+              nextConfig.lastSyncedAt = new Date().toISOString();
+              persistStorageConfig(nextConfig);
+              notice = `Initialized new remote store at ${nextConfig.remoteUrl}.`;
+            }
+          }
+        } else if (body.migrateData !== false) {
+          const pushed = await pushStoreToRemote(currentSnapshot, nextConfig);
+          if (!pushed.ok) {
+            nextConfig.lastSyncError = pushed.message;
+            persistStorageConfig(nextConfig);
+            res.status(400).json({ error: pushed.message, config: getPublicStorageConfig() });
+            return;
+          }
+          nextConfig.lastSyncedAt = new Date().toISOString();
+          nextConfig.lastSyncError = null;
+          persistStorageConfig(nextConfig);
+          notice = `Saved & pushed full Mnemosyne + UI store to ${nextMode.toUpperCase()}.`;
+        }
+      } else {
+        // local mode
+        persistStorageConfig(nextConfig);
+        if (body.migrateData !== false) {
+          writeFileAtomic(
+            path.resolve(process.cwd(), 'data', 'aetheris-store.json'),
+            currentSnapshot
+          );
+        }
+        reloadStateFromStorage();
+        notice = 'Storage backend set to Local Workspace (./data/aetheris-store.json).';
+      }
+
+      res.json({
+        config: getPublicStorageConfig(),
+        state: getPublicAppState(),
+        providers: getProviderStatuses(),
+        notice,
+      });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to update storage configuration',
+      });
+    }
+  });
+
+  app.post('/api/storage/sync', async (req, res) => {
+    try {
+      const { direction } = (req.body ?? {}) as { direction?: 'push' | 'pull' };
+      const cfg = loadStorageConfig();
+
+      if (direction === 'pull') {
+        if (cfg.mode === 'webdav' || cfg.mode === 'remote-http') {
+          const pulled = await pullStoreFromRemote();
+          if (!pulled.ok) {
+            res.status(400).json({ error: pulled.message, config: getPublicStorageConfig() });
+            return;
+          }
+          replaceStateFromRawJson(pulled.raw);
+          res.json({
+            ok: true,
+            notice: `Pulled latest Mnemosyne & UI store from ${cfg.mode.toUpperCase()}.`,
+            config: getPublicStorageConfig(),
+            state: getPublicAppState(),
+            providers: getProviderStatuses(),
+          });
+          return;
+        }
+        reloadStateFromStorage();
+        res.json({
+          ok: true,
+          notice: `Reloaded workspace store from ${getPublicStorageConfig().activeStoreFile}.`,
+          config: getPublicStorageConfig(),
+          state: getPublicAppState(),
+          providers: getProviderStatuses(),
+        });
+        return;
+      }
+
+      // push
+      const snapshot = exportSerializedState();
+      if (cfg.mode === 'webdav' || cfg.mode === 'remote-http') {
+        const pushed = await pushStoreToRemote(snapshot);
+        if (!pushed.ok) {
+          res.status(400).json({ error: pushed.message, config: getPublicStorageConfig() });
+          return;
+        }
+        res.json({
+          ok: true,
+          notice: pushed.message,
+          config: getPublicStorageConfig(),
+        });
+        return;
+      }
+
+      if (cfg.mode === 'mounted') {
+        const check = validateMountedPath(cfg.mountedPath);
+        if (!check.ok) {
+          res.status(400).json({ error: check.error });
+          return;
+        }
+        writeFileAtomic(check.resolvedFile, snapshot);
+        cfg.lastSyncedAt = new Date().toISOString();
+        cfg.lastSyncError = null;
+        persistStorageConfig(cfg);
+        res.json({
+          ok: true,
+          notice: `Flushed full Mnemosyne + UI store to ${check.resolvedFile}.`,
+          config: getPublicStorageConfig(),
+        });
+        return;
+      }
+
+      writeFileAtomic(path.resolve(process.cwd(), 'data', 'aetheris-store.json'), snapshot);
+      res.json({
+        ok: true,
+        notice: 'Flushed workspace store to local disk.',
+        config: getPublicStorageConfig(),
+      });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Storage sync failed',
+      });
+    }
   });
 
   // Threads CRUD
@@ -179,7 +462,98 @@ async function startServer() {
     }
   });
 
-  // Streaming Chat SSE Endpoint (Multi-Provider + Multimodal + Mnemosyne OS)
+  // Modular Web Recon Search, Connection Test & Page Extraction
+  app.post('/api/search', async (req, res) => {
+    try {
+      const { query, queries, sessionId, provider, maxResults } = req.body as {
+        query?: string;
+        queries?: string[];
+        sessionId?: string;
+        provider?: SearchProvider;
+        maxResults?: number;
+      };
+      const objective = (query || '').trim();
+      if (!objective) {
+        res.status(400).json({ error: 'Search query is required.' });
+        return;
+      }
+      const result = await executeWebReconSearch({
+        query: objective,
+        provider,
+        maxResults,
+        queries: Array.isArray(queries) ? queries : undefined,
+        sessionId,
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(502).json({
+        error: err instanceof Error ? err.message : 'Web Recon search failed',
+      });
+    }
+  });
+
+  app.post('/api/search/test', async (req, res) => {
+    try {
+      const {
+        provider,
+        searxngBaseUrl,
+        customSearchUrl,
+        customSearchMethod,
+        maxSearchResults,
+      } = (req.body ?? {}) as {
+        provider?: SearchProvider;
+        searxngBaseUrl?: string;
+        customSearchUrl?: string;
+        customSearchMethod?: 'GET' | 'POST';
+        maxSearchResults?: number;
+      };
+      const result = await testSearchProviderConnection({
+        provider,
+        searxngBaseUrl,
+        customSearchUrl,
+        customSearchMethod,
+        maxSearchResults,
+      });
+      res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        message: err instanceof Error ? err.message : 'Search provider test failed',
+      });
+    }
+  });
+
+  app.post('/api/search/fetch', async (req, res) => {
+    try {
+      const { url, urls, objective, sessionId } = req.body as {
+        url?: string;
+        urls?: string[];
+        objective?: string;
+        sessionId?: string;
+      };
+      const targetUrls = Array.isArray(urls)
+        ? urls
+        : url
+          ? [url]
+          : [];
+      if (targetUrls.length === 0) {
+        res.status(400).json({ error: 'A valid public http/https URL is required.' });
+        return;
+      }
+      const result = await parallelWebFetch({
+        urls: targetUrls,
+        objective,
+        sessionId,
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Web page extraction failed',
+      });
+    }
+  });
+
+  // Streaming Chat SSE Endpoint (Multi-Provider + Multimodal + Mnemosyne OS + Parallel Search)
   app.post('/api/chat/stream', async (req, res) => {
     const {
       threadId,
@@ -188,6 +562,7 @@ async function startServer() {
       provider,
       model,
       useMnemosyne = true,
+      useWebSearch,
     } = req.body as {
       threadId: string;
       message: string;
@@ -195,6 +570,7 @@ async function startServer() {
       provider: LLMProvider;
       model: string;
       useMnemosyne?: boolean;
+      useWebSearch?: boolean;
     };
 
     const thread = getThread(threadId);
@@ -243,13 +619,79 @@ async function startServer() {
         writeSSE({ type: 'mnemosyne_recall', recalled });
       }
 
+      // 2. Modular Web Recon Routing (Gemini Native / SearXNG / Brave / Tavily / Custom / Parallel)
+      const shouldSearchWeb =
+        (useWebSearch ?? state.settings.useWebSearchInChat) &&
+        (message || '').trim().length >= 3;
+      const activeSearchProvider: SearchProvider =
+        state.settings.searchProvider || 'gemini-native';
+      const maxSearchResults = state.settings.maxSearchResults || 5;
+      const useGeminiNativeTool =
+        shouldSearchWeb &&
+        activeSearchProvider === 'gemini-native' &&
+        provider === 'gemini';
+
+      let webSources: WebSearchSource[] = [];
+      let webSearchBlock = '';
+      const webSearchQuery = (message || '').trim();
+
+      if (shouldSearchWeb) {
+        writeSSE({
+          type: 'web_search_start',
+          query: webSearchQuery,
+          provider: activeSearchProvider,
+        });
+
+        if (!useGeminiNativeTool) {
+          try {
+            const searchResult = await executeWebReconSearch({
+              query: webSearchQuery,
+              provider: activeSearchProvider,
+              maxResults: maxSearchResults,
+            });
+            webSources = searchResult.results;
+            if (webSources.length > 0) {
+              webSearchBlock = formatWebSearchSystemBlock(
+                webSearchQuery,
+                webSources,
+                activeSearchProvider
+              );
+              writeSSE({
+                type: 'web_search_results',
+                query: webSearchQuery,
+                provider: activeSearchProvider,
+                sources: webSources,
+              });
+            } else {
+              writeSSE({
+                type: 'web_search_results',
+                query: webSearchQuery,
+                provider: activeSearchProvider,
+                sources: [],
+              });
+            }
+          } catch (searchErr) {
+            writeSSE({
+              type: 'web_search_error',
+              provider: activeSearchProvider,
+              message:
+                searchErr instanceof Error ? searchErr.message : 'Web Recon search skipped',
+            });
+          }
+        }
+      }
+
       const mnemosyneBlock = formatMnemosyneSystemBlock(recalled);
-      const systemInstruction = [state.settings.systemPrompt, mnemosyneBlock]
+      const systemInstruction = [
+        state.settings.systemPrompt,
+        mnemosyneBlock,
+        webSearchBlock,
+      ]
         .filter(Boolean)
         .join('\n\n');
 
-      // 2. Stream LLM completion
-      const { fullText, fullReasoning } = await streamChatCompletion({
+      // 3. Stream LLM completion
+      const { fullText, fullReasoning, groundingSources } = await streamChatCompletion({
         res,
         provider,
         model,
@@ -257,9 +699,15 @@ async function startServer() {
         history: historyBefore,
         userText: message || '',
         attachments,
+        enableGeminiGoogleSearch: useGeminiNativeTool,
+        maxSearchResults,
       });
 
-      // 3. Mnemosyne Auto-Consolidation
+      if (useGeminiNativeTool && groundingSources.length > 0) {
+        webSources = groundingSources;
+      }
+
+      // 4. Mnemosyne Auto-Consolidation
       let consolidatedMemories: MnemosyneMemory[] = [];
       if (useMnemosyne && state.settings.autoConsolidateMemory && fullText.trim()) {
         consolidatedMemories = await consolidateMemoriesFromTurn(
@@ -286,6 +734,9 @@ async function startServer() {
             : undefined,
         consolidatedMemories:
           consolidatedMemories.length > 0 ? consolidatedMemories : undefined,
+        webSearchQuery: webSources.length > 0 ? webSearchQuery : undefined,
+        webSearchProvider: webSources.length > 0 ? activeSearchProvider : undefined,
+        webSources: webSources.length > 0 ? webSources : undefined,
         createdAt: new Date().toISOString(),
       };
 
@@ -432,12 +883,79 @@ async function startServer() {
   attachWebSocketServers(server);
 
   // Vite dev middleware vs static production build
+  let startViteAfterListen: (() => void) | null = null;
+
   if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true, hmr: false },
-      appType: 'spa',
+    const viteState: { server: ViteDevServer | null; error: Error | null } = {
+      server: null,
+      error: null,
+    };
+    const getViteState = () => viteState;
+    let vitePromise: Promise<void> | null = null;
+
+    const ensureVite = (): Promise<void> => {
+      if (vitePromise) return vitePromise;
+      vitePromise = import('vite')
+        .then(({ createServer }) =>
+          createServer({
+            server: { middlewareMode: true, hmr: false, watch: null },
+            appType: 'custom',
+          })
+        )
+        .then((vite) => {
+          viteState.server = vite;
+        })
+        .catch((err) => {
+          viteState.error = err instanceof Error ? err : new Error(String(err));
+          console.error('Vite dev middleware initialization failed:', viteState.error);
+        });
+      return vitePromise;
+    };
+
+    startViteAfterListen = () => {
+      setImmediate(() => {
+        void ensureVite();
+      });
+    };
+
+    app.use(async (req, res, next) => {
+      let current = getViteState();
+      if (current.error) {
+        res.status(500).send(`Dev server initialization error: ${current.error.message}`);
+        return;
+      }
+      if (!current.server) {
+        await Promise.race([
+          ensureVite(),
+          new Promise<void>((resolve) => setTimeout(resolve, 1500)),
+        ]);
+        current = getViteState();
+      }
+      if (current.error) {
+        res.status(500).send(`Dev server initialization error: ${current.error.message}`);
+        return;
+      }
+      if (current.server) {
+        current.server.middlewares(req, res, next);
+        return;
+      }
+      if (req.headers.accept?.includes('text/html') || req.path === '/') {
+        res
+          .status(200)
+          .setHeader('Content-Type', 'text/html; charset=utf-8')
+          .send(
+            '<!doctype html><html><head><meta http-equiv="refresh" content="2"><title>Pheonikz UI</title></head><body style="background:#0a0b08;color:#8fa85c;font-family:monospace;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">INITIALIZING PHEONIKZ UI TACTICAL NODE...</body></html>'
+          );
+        return;
+      }
+      await ensureVite();
+      current = getViteState();
+      if (current.server) {
+        current.server.middlewares(req, res, next);
+        return;
+      }
+      next();
     });
-    app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
     app.use(express.static(distDir));
@@ -447,7 +965,8 @@ async function startServer() {
   }
 
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Aetheris WebUI server listening on http://0.0.0.0:${PORT}`);
+    console.log(`Pheonikz UI server listening on http://0.0.0.0:${PORT}`);
+    startViteAfterListen?.();
   });
 }
 

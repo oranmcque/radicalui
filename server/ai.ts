@@ -10,6 +10,7 @@ import type {
   ProviderStatus,
   STTProvider,
   TTSProvider,
+  WebSearchSource,
 } from '../src/types/index.js';
 import { addMemory, loadState, resolveProviderKey } from './store.js';
 
@@ -118,6 +119,10 @@ export function getProviderStatuses(): ProviderStatus[] {
   const nano = resolveProviderKey('nanogpt');
   const deepseek = resolveProviderKey('deepseek');
   const openai = resolveProviderKey('openai');
+  const parallel = resolveProviderKey('parallel');
+  const brave = resolveProviderKey('brave');
+  const tavily = resolveProviderKey('tavily');
+  const customSearch = resolveProviderKey('custom_search');
 
   return [
     {
@@ -127,7 +132,7 @@ export function getProviderStatuses(): ProviderStatus[] {
       envVar: 'GEMINI_API_KEY',
       configured: hasGemini,
       source: hasGemini ? 'env' : 'none',
-      note: 'Powers Gemini 4 Hydrogen, Gemini Live Call (3.8-live), Transcribe (3.5), and TTS (3.8).',
+      note: 'Powers Gemini 4 Hydrogen, Gemini Native Search Grounding, Live Call (3.8-live), Transcribe, and TTS.',
     },
     {
       id: 'deepgram',
@@ -173,6 +178,42 @@ export function getProviderStatuses(): ProviderStatus[] {
       configured: Boolean(openai.key),
       source: openai.source,
       note: 'GPT-4o and GPT-4.1 multimodal completions.',
+    },
+    {
+      id: 'brave',
+      name: 'Brave Search API',
+      category: 'search',
+      envVar: 'BRAVE_API_KEY',
+      configured: Boolean(brave.key),
+      source: brave.source,
+      note: 'Independent web search index via api.search.brave.com.',
+    },
+    {
+      id: 'tavily',
+      name: 'Tavily Search API',
+      category: 'search',
+      envVar: 'TAVILY_API_KEY',
+      configured: Boolean(tavily.key),
+      source: tavily.source,
+      note: 'AI-optimized web search & snippet extraction via api.tavily.com.',
+    },
+    {
+      id: 'custom_search',
+      name: 'Custom Search Endpoint Key',
+      category: 'search',
+      envVar: 'CUSTOM_SEARCH_API_KEY',
+      configured: Boolean(customSearch.key),
+      source: customSearch.source,
+      note: 'Optional Bearer token sent to your Custom Search Endpoint URL.',
+    },
+    {
+      id: 'parallel',
+      name: 'Parallel Web Search MCP',
+      category: 'search',
+      envVar: 'PARALLEL_API_KEY',
+      configured: Boolean(parallel.key),
+      source: parallel.source,
+      note: 'Real-time internet search & webpage extraction via mcp.parallel.ai/mcp (anonymous fallback active if key unset).',
     },
   ];
 }
@@ -227,6 +268,15 @@ function buildOpenAIMessages(
   return messages;
 }
 
+function isSafeHttpUrl(raw: string): boolean {
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
 export async function streamChatCompletion(params: {
   res: Response;
   provider: LLMProvider;
@@ -235,8 +285,20 @@ export async function streamChatCompletion(params: {
   history: ChatMessage[];
   userText: string;
   attachments: ChatAttachment[];
-}): Promise<{ fullText: string; fullReasoning: string }> {
-  const { res, provider, model, systemInstruction, history, userText, attachments } = params;
+  enableGeminiGoogleSearch?: boolean;
+  maxSearchResults?: number;
+}): Promise<{ fullText: string; fullReasoning: string; groundingSources: WebSearchSource[] }> {
+  const {
+    res,
+    provider,
+    model,
+    systemInstruction,
+    history,
+    userText,
+    attachments,
+    enableGeminiGoogleSearch = false,
+    maxSearchResults = 5,
+  } = params;
 
   if (provider === 'gemini') {
     const ai = getGeminiClient();
@@ -283,23 +345,90 @@ export async function streamChatCompletion(params: {
     }
     contents.push({ role: 'user', parts: currentParts });
 
+    const geminiConfig: Record<string, unknown> = {
+      systemInstruction: systemInstruction || undefined,
+    };
+    if (enableGeminiGoogleSearch) {
+      geminiConfig.tools = [{ googleSearch: {} }];
+    }
+
     const stream = await ai.models.generateContentStream({
       model: model || 'gemini-4-hydrogen',
       contents: contents as never,
-      config: {
-        systemInstruction: systemInstruction || undefined,
-      },
+      config: geminiConfig as never,
     });
 
     let fullText = '';
+    const groundingMap = new Map<string, WebSearchSource>();
+    const chunkList: Array<{ url: string; title: string }> = [];
+
     for await (const chunk of stream) {
       const chunkText = chunk.text ?? '';
       if (chunkText) {
         fullText += chunkText;
         writeSSE(res, { type: 'delta', text: chunkText });
       }
+
+      if (enableGeminiGoogleSearch) {
+        const meta = chunk.candidates?.[0]?.groundingMetadata as
+          | {
+              groundingChunks?: Array<{ web?: { uri?: string; title?: string } }>;
+              groundingSupports?: Array<{
+                segment?: { text?: string };
+                groundingChunkIndices?: number[];
+              }>;
+            }
+          | undefined;
+
+        if (meta?.groundingChunks) {
+          for (let i = 0; i < meta.groundingChunks.length; i++) {
+            const web = meta.groundingChunks[i]?.web;
+            if (web?.uri && isSafeHttpUrl(web.uri)) {
+              const title = (web.title || web.uri).trim();
+              chunkList[i] = { url: web.uri, title };
+              if (!groundingMap.has(web.uri)) {
+                groundingMap.set(web.uri, {
+                  title,
+                  url: web.uri,
+                  publishDate: null,
+                  excerpt: '',
+                  provider: 'gemini-native',
+                });
+              }
+            }
+          }
+        }
+
+        if (meta?.groundingSupports) {
+          for (const support of meta.groundingSupports) {
+            const snippet = support.segment?.text?.trim();
+            if (!snippet || !support.groundingChunkIndices) continue;
+            for (const idx of support.groundingChunkIndices) {
+              const ref = chunkList[idx];
+              if (!ref) continue;
+              const existing = groundingMap.get(ref.url);
+              if (existing && existing.excerpt.length < 320) {
+                existing.excerpt = existing.excerpt
+                  ? `${existing.excerpt} ${snippet}`.slice(0, 420)
+                  : snippet.slice(0, 420);
+              }
+            }
+          }
+        }
+      }
     }
-    return { fullText, fullReasoning: '' };
+
+    const groundingSources = Array.from(groundingMap.values()).slice(0, maxSearchResults);
+    if (enableGeminiGoogleSearch && groundingSources.length > 0) {
+      writeSSE(res, {
+        type: 'web_search_results',
+        query: userText,
+        provider: 'gemini-native',
+        sources: groundingSources,
+      });
+    }
+
+    return { fullText, fullReasoning: '', groundingSources };
   }
 
   // OpenAI-compatible streaming (NanoGPT, DeepSeek, OpenAI)
@@ -374,7 +503,7 @@ export async function streamChatCompletion(params: {
     }
   }
 
-  return { fullText, fullReasoning };
+  return { fullText, fullReasoning, groundingSources: [] };
 }
 
 /**

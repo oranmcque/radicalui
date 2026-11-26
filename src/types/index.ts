@@ -5,6 +5,13 @@ export type MemoryTier = 'core' | 'episodic' | 'semantic' | 'procedural';
 export type VoicePipelineMode = 'gemini-live' | 'modular';
 export type STTProvider = 'deepgram' | 'gemini';
 export type TTSProvider = 'fishaudio' | 'deepgram' | 'gemini';
+export type SearchProvider =
+  | 'gemini-native'
+  | 'searxng'
+  | 'brave'
+  | 'tavily'
+  | 'custom'
+  | 'parallel';
 
 export interface ModelOption {
   id: string;
@@ -20,7 +27,7 @@ export interface ModelOption {
 export interface ProviderStatus {
   id: string;
   name: string;
-  category: 'llm' | 'stt' | 'tts' | 'realtime';
+  category: 'llm' | 'stt' | 'tts' | 'realtime' | 'search';
   envVar: string;
   configured: boolean;
   source?: 'env' | 'vault' | 'none';
@@ -74,6 +81,14 @@ export interface RecalledContext {
   vaultChunks: VaultChunk[];
 }
 
+export interface WebSearchSource {
+  title: string;
+  url: string;
+  publishDate?: string | null;
+  excerpt: string;
+  provider?: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -84,6 +99,9 @@ export interface ChatMessage {
   provider?: LLMProvider;
   recalled?: RecalledContext;
   consolidatedMemories?: MnemosyneMemory[];
+  webSearchQuery?: string;
+  webSearchProvider?: SearchProvider;
+  webSources?: WebSearchSource[];
   createdAt: string;
 }
 
@@ -110,6 +128,29 @@ export interface WorkspaceSettings {
   systemPrompt: string;
   autoConsolidateMemory: boolean;
   useMnemosyneInChat: boolean;
+  useWebSearchInChat: boolean;
+  searchProvider: SearchProvider;
+  searxngBaseUrl: string;
+  customSearchUrl: string;
+  customSearchMethod: 'GET' | 'POST';
+  maxSearchResults: number;
+}
+
+export type StorageMode = 'local' | 'mounted' | 'webdav' | 'remote-http';
+
+export interface StorageConfigPublic {
+  mode: StorageMode;
+  mountedPath: string;
+  remoteUrl: string;
+  remoteUsername: string;
+  hasRemotePassword: boolean;
+  hasRemoteToken: boolean;
+  remoteMethod: 'PUT' | 'POST';
+  autoSyncRemote: boolean;
+  activeStoreFile: string;
+  lastSyncedAt: string | null;
+  lastSyncError: string | null;
+  storeSizeBytes: number;
 }
 
 export interface AppStatePayload {
