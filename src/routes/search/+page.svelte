@@ -11,7 +11,6 @@
     Sparkles,
   } from 'lucide-svelte';
   import type { SearchProvider, WebSearchSource } from '../../types/index';
-  import { safeParseJson } from '#lib/uuid';
   import {
     createNewThread,
     refreshWorkspace,
@@ -86,16 +85,13 @@
           maxResults: $settings.maxSearchResults ?? 5,
         }),
       });
-      const data = await safeParseJson<{
+      const data = (await res.json()) as {
         results?: WebSearchSource[];
         provider?: string;
         error?: string;
-      }>(res);
-      if (!res.ok || !data) {
-        throw new Error(
-          data?.error ||
-            `Search API unavailable (HTTP ${res.status}). Start the Node backend to execute live Web Recon.`
-        );
+      };
+      if (!res.ok) {
+        throw new Error(data.error || 'Internet search failed');
       }
       results = data.results ?? [];
       lastProvider = data.provider ?? activeProvider;
@@ -126,14 +122,12 @@
           objective: query.trim() || undefined,
         }),
       });
-      const data = await safeParseJson<{
+      const data = (await res.json()) as {
         results?: FetchedPage[];
         error?: string;
-      }>(res);
-      if (!res.ok || !data) {
-        throw new Error(
-          data?.error || `Page extraction unavailable (HTTP ${res.status})`
-        );
+      };
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to read webpage');
       }
       const first = data.results?.[0];
       if (first) {

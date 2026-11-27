@@ -32,18 +32,3 @@ export function generateUUID(): string {
     return val.toString(16);
   });
 }
-
-/**
- * Safely parses JSON from a Fetch Response without throwing on HTML 404/502 pages.
- */
-export async function safeParseJson<T>(res: Response): Promise<T | null> {
-  try {
-    const contentType = res.headers.get('content-type') || '';
-    if (!contentType.includes('application/json')) {
-      return null;
-    }
-    return (await res.json()) as T;
-  } catch {
-    return null;
-  }
-}

@@ -1,17 +1,23 @@
 <script lang="ts">
   import {
+    AlertCircle,
     Brain,
     ChevronDown,
     ChevronRight,
+    Download,
     ExternalLink,
     FileText,
     Globe,
     Image as ImageIcon,
+    Loader2,
+    Maximize2,
     Mic,
     MicOff,
     Paperclip,
     Radio,
+    RotateCcw,
     SendHorizontal,
+    Sparkles,
     Square,
     Volume2,
     VolumeX,
@@ -19,10 +25,21 @@
   } from 'lucide-svelte';
   import MarkdownRenderer from '#lib/components/MarkdownRenderer.svelte';
   import { blobToBase64 } from '#lib/audio';
-  import { generateUUID, safeParseJson } from '#lib/uuid';
-  import type { ChatAttachment, SearchProvider } from '../types/index';
+  import { generateUUID } from '#lib/uuid';
+  import {
+    IMAGE_ASPECT_RATIOS,
+    getImageApiConfig,
+  } from '#lib/services/imageGenerationService';
+  import type {
+    ChatAttachment,
+    GeneratedImageItem,
+    ImageAspectRatio,
+    SearchProvider,
+  } from '../types/index';
   import {
     activeThread,
+    generateChatImage,
+    isGeneratingImage,
     isStreaming,
     sendChatMessage,
     settings,
@@ -69,6 +86,10 @@
   let expandedWebSources = $state<Record<string, boolean>>({});
   let expandedReasoning = $state<Record<string, boolean>>({});
   let errorBanner = $state<string | null>(null);
+  let imageMode = $state(false);
+  let selectedAspectRatio = $state<ImageAspectRatio>('1:1');
+  let lightboxImage = $state<GeneratedImageItem | null>(null);
+  const imageApiConfigured = getImageApiConfig().configured;
 
   let fileInputEl: HTMLInputElement | undefined = $state();
   let textareaEl: HTMLTextAreaElement | undefined = $state();
@@ -183,11 +204,77 @@
     attachments = attachments.filter((a) => a.id !== id);
   }
 
+  function getAspectClass(ratio: ImageAspectRatio): string {
+    switch (ratio) {
+      case '16:9':
+        return 'aspect-video';
+      case '9:16':
+        return 'aspect-[9/16] max-w-[260px]';
+      case '4:3':
+        return 'aspect-[4/3]';
+      case '3:4':
+        return 'aspect-[3/4] max-w-[320px]';
+      default:
+        return 'aspect-square max-w-[420px]';
+    }
+  }
+
+  async function handleDownloadImage(img: GeneratedImageItem) {
+    if (!img.url) return;
+    const filename = `pheonikz-image-${img.id.slice(0, 8)}.png`;
+    try {
+      let downloadHref = img.url;
+      let objectUrlToRevoke: string | null = null;
+      if (!img.url.startsWith('data:')) {
+        try {
+          const res = await fetch(img.url);
+          if (res.ok) {
+            const blob = await res.blob();
+            objectUrlToRevoke = URL.createObjectURL(blob);
+            downloadHref = objectUrlToRevoke;
+          }
+        } catch {
+          // Cross-origin fetch blocked: fall back to direct link download
+        }
+      }
+      const link = document.createElement('a');
+      link.href = downloadHref;
+      link.download = filename;
+      link.rel = 'noopener noreferrer';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      if (objectUrlToRevoke) {
+        setTimeout(() => URL.revokeObjectURL(objectUrlToRevoke!), 1500);
+      }
+    } catch {
+      errorBanner = 'Unable to download image in this browser context.';
+    }
+  }
+
   async function handleSend() {
-    if ((!input.trim() && attachments.length === 0) || $isStreaming) return;
+    if ((!input.trim() && attachments.length === 0) || $isStreaming || $isGeneratingImage) return;
     errorBanner = null;
     const textToSend = input.trim();
     const attached = [...attachments];
+
+    const slashMatch = textToSend.match(/^\/(?:image|img)\s+([\s\S]+)$/i);
+    if (imageMode || slashMatch) {
+      const imgPrompt = (slashMatch ? slashMatch[1] : textToSend).trim();
+      if (!imgPrompt) {
+        errorBanner = 'Enter a descriptive prompt to generate an image.';
+        return;
+      }
+      input = '';
+      if (textareaEl) textareaEl.style.height = '54px';
+      try {
+        await generateChatImage(imgPrompt, selectedAspectRatio);
+      } catch (err) {
+        errorBanner = err instanceof Error ? err.message : 'Image generation failed';
+      }
+      return;
+    }
+
     input = '';
     attachments = [];
     if (textareaEl) textareaEl.style.height = '54px';
@@ -238,10 +325,8 @@
               provider: $settings.sttProvider,
             }),
           });
-          const data = await safeParseJson<{ transcript?: string; error?: string }>(res);
-          if (!res.ok || !data) {
-            throw new Error(data?.error || `Transcription unavailable (HTTP ${res.status})`);
-          }
+          const data = (await res.json()) as { transcript?: string; error?: string };
+          if (!res.ok) throw new Error(data.error || 'Transcription failed');
           if (data.transcript) {
             input = input ? `${input} ${data.transcript}` : data.transcript;
           }
@@ -279,12 +364,8 @@
         }),
       });
       if (!res.ok) {
-        const errData = await safeParseJson<{ error?: string }>(res);
-        throw new Error(errData?.error || `TTS synthesis unavailable (HTTP ${res.status})`);
-      }
-      const contentType = res.headers.get('content-type') || '';
-      if (!contentType.startsWith('audio/')) {
-        throw new Error('TTS endpoint unavailable in standalone static mode.');
+        const errData = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(errData.error || 'TTS synthesis failed');
       }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
@@ -514,7 +595,121 @@
                   </div>
                 {/if}
 
-                <MarkdownRenderer content={msg.content} />
+                {#if msg.generatedImage}
+                  {@const genImg = msg.generatedImage}
+                  <div class="space-y-2 my-1">
+                    {#if genImg.status === 'loading'}
+                      <div
+                        class="w-full {getAspectClass(genImg.aspectRatio)} rounded border border-[#005a63]/60 bg-[#050d0f] flex flex-col items-center justify-center gap-2.5 p-4 text-center relative overflow-hidden"
+                      >
+                        <div class="absolute inset-0 crt-scanlines opacity-30 pointer-events-none"></div>
+                        <Loader2 class="w-6 h-6 text-cyber-cyan animate-spin relative z-10" />
+                        <div class="relative z-10 space-y-1">
+                          <div class="text-[11px] font-bold tracking-wider text-cyber-cyan uppercase">
+                            Synthesizing Image · {genImg.aspectRatio} ({genImg.size})
+                          </div>
+                          <p class="font-prose text-xs text-stone-400 line-clamp-2 max-w-md">
+                            {genImg.prompt}
+                          </p>
+                        </div>
+                      </div>
+                    {:else if genImg.status === 'ready' && genImg.url}
+                      <div class="rounded border border-[#005a63]/65 bg-[#050c0e] overflow-hidden">
+                        <button
+                          type="button"
+                          onclick={() => (lightboxImage = genImg)}
+                          class="block w-full bg-black/40 cursor-zoom-in focus:outline-none"
+                          aria-label="Open full-size generated image preview"
+                        >
+                          <img
+                            src={genImg.url}
+                            alt={genImg.prompt}
+                            referrerpolicy="no-referrer"
+                            class="w-full max-h-[460px] object-contain mx-auto"
+                          />
+                        </button>
+                        <div
+                          class="px-2.5 py-2 border-t border-[#005a63]/35 bg-[#071215] flex flex-wrap items-center justify-between gap-2 text-[10px]"
+                        >
+                          <span class="text-stone-400 uppercase tracking-wider truncate">
+                            IMG · {genImg.aspectRatio} · {genImg.size}
+                          </span>
+                          <div class="flex items-center gap-1.5 shrink-0">
+                            <button
+                              type="button"
+                              onclick={() => (lightboxImage = genImg)}
+                              class="h-7 px-2 rounded border border-[#005a63]/60 bg-[#091517] hover:border-cyber-cyan text-cyber-cyan inline-flex items-center gap-1 font-bold uppercase cursor-pointer"
+                            >
+                              <Maximize2 class="w-3 h-3" />
+                              <span>View</span>
+                            </button>
+                            {#if safeExternalUrl(genImg.url)}
+                              <a
+                                href={safeExternalUrl(genImg.url)}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                class="h-7 px-2 rounded border border-[#005a63]/60 bg-[#091517] hover:border-cyber-cyan text-cyber-cyan inline-flex items-center gap-1 font-bold uppercase"
+                              >
+                                <ExternalLink class="w-3 h-3" />
+                                <span>Open</span>
+                              </a>
+                            {/if}
+                            <button
+                              type="button"
+                              onclick={() => void handleDownloadImage(genImg)}
+                              class="h-7 px-2 rounded border border-olive-bright/40 bg-[#3d462c]/70 hover:bg-[#4c5836] text-stone-100 inline-flex items-center gap-1 font-bold uppercase cursor-pointer"
+                            >
+                              <Download class="w-3 h-3 text-olive-bright" />
+                              <span>Download</span>
+                            </button>
+                          </div>
+                        </div>
+                        {#if genImg.revisedPrompt || genImg.prompt}
+                          <div class="px-2.5 py-1.5 border-t border-[#005a63]/20 font-prose text-[11.5px] text-cyan-100/75 leading-snug">
+                            {genImg.revisedPrompt || genImg.prompt}
+                          </div>
+                        {/if}
+                      </div>
+                    {:else}
+                      <div
+                        class="rounded border border-red-500/45 bg-red-950/35 p-3 space-y-2 text-xs"
+                      >
+                        <div class="flex items-start gap-2 text-red-300">
+                          <AlertCircle class="w-4 h-4 shrink-0 mt-0.5 text-red-400" />
+                          <div class="space-y-0.5 min-w-0">
+                            <div class="font-mono text-[10.5px] font-bold uppercase tracking-wider text-red-300">
+                              Image Generation Error · {genImg.aspectRatio}
+                            </div>
+                            <p class="font-prose text-xs text-red-200/90 leading-snug break-words">
+                              {genImg.error || 'Image generation failed.'}
+                            </p>
+                          </div>
+                        </div>
+                        <div class="flex items-center justify-between gap-2 pt-1 border-t border-red-500/20">
+                          <span class="font-prose text-[11px] text-stone-400 truncate">
+                            Prompt: {genImg.prompt}
+                          </span>
+                          <button
+                            type="button"
+                            disabled={$isGeneratingImage}
+                            onclick={() =>
+                              void generateChatImage(genImg.prompt, genImg.aspectRatio, {
+                                retryMessageId: msg.id,
+                              })}
+                            class="h-7 px-2.5 rounded border border-red-400/45 bg-red-900/40 hover:bg-red-800/50 disabled:opacity-40 text-red-100 text-[10px] font-bold uppercase inline-flex items-center gap-1 cursor-pointer shrink-0"
+                          >
+                            <RotateCcw class="w-3 h-3" />
+                            <span>Retry</span>
+                          </button>
+                        </div>
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
+
+                {#if msg.content.trim()}
+                  <MarkdownRenderer content={msg.content} />
+                {/if}
 
                 <!-- Collapsible Source / Receipt Chips Below Assistant Message -->
                 {#if webCount > 0 && msg.webSources}
@@ -606,18 +801,21 @@
                     {msg.provider || $settings.activeProvider} // {msg.model || $settings.activeModel}
                   </span>
                   <div class="flex items-center gap-1 shrink-0">
+                    {#if msg.content.trim()}
+                      <button
+                        type="button"
+                        onclick={() => void handlePlayTts(msg.id, msg.content)}
+                        class="h-7 px-2 rounded hover:text-cyber-cyan hover:bg-[#005a63]/20 transition-colors cursor-pointer uppercase {playingMessageId === msg.id
+                          ? 'text-cyber-cyan font-bold'
+                          : ''}"
+                      >
+                        {playingMessageId === msg.id ? 'STOP' : 'SPEAK'}
+                      </button>
+                    {/if}
                     <button
                       type="button"
-                      onclick={() => void handlePlayTts(msg.id, msg.content)}
-                      class="h-7 px-2 rounded hover:text-cyber-cyan hover:bg-[#005a63]/20 transition-colors cursor-pointer uppercase {playingMessageId === msg.id
-                        ? 'text-cyber-cyan font-bold'
-                        : ''}"
-                    >
-                      {playingMessageId === msg.id ? 'STOP' : 'SPEAK'}
-                    </button>
-                    <button
-                      type="button"
-                      onclick={() => void handleCopy(msg.id, msg.content)}
+                      onclick={() =>
+                        void handleCopy(msg.id, msg.content || msg.generatedImage?.prompt || '')}
                       class="h-7 px-2 rounded hover:text-cyber-cyan hover:bg-[#005a63]/20 transition-colors cursor-pointer uppercase"
                     >
                       {copiedId === msg.id ? 'COPIED' : 'COPY'}
@@ -754,6 +952,39 @@
         </div>
       {/if}
 
+      {#if imageMode}
+        <div
+          class="flex flex-wrap items-center justify-between gap-1.5 px-2.5 py-1.5 border-b border-olive-drab/25 bg-[#10140d]"
+        >
+          <div class="flex items-center gap-1 flex-wrap">
+            <span class="inline-flex items-center gap-1 text-[10px] font-bold tracking-wider text-olive-bright uppercase mr-1">
+              <Sparkles class="w-3 h-3" />
+              <span>RATIO</span>
+            </span>
+            {#each IMAGE_ASPECT_RATIOS as ratio (ratio.id)}
+              <button
+                type="button"
+                onclick={() => (selectedAspectRatio = ratio.id)}
+                title="{ratio.label} ({ratio.size})"
+                class="h-6 px-2 rounded border text-[10px] font-bold tracking-wide transition-colors cursor-pointer {selectedAspectRatio === ratio.id
+                  ? 'border-olive-bright bg-olive-drab/30 text-olive-bright'
+                  : 'border-olive-drab/35 text-stone-400 hover:text-stone-200'}"
+              >
+                {ratio.label}
+              </button>
+            {/each}
+          </div>
+          {#if !imageApiConfigured}
+            <span
+              title="Set VITE_IMAGE_ENDPOINT and VITE_IMAGE_API_KEY in .env"
+              class="text-[9.5px] font-bold uppercase tracking-wider text-amber-400"
+            >
+              VITE_IMAGE_* UNSET
+            </span>
+          {/if}
+        </div>
+      {/if}
+
       <!-- Generous Auto-Growing Prompt Input -->
       <textarea
         bind:this={textareaEl}
@@ -768,9 +999,11 @@
         rows={2}
         placeholder={isTranscribing
           ? 'Transcribing audio...'
-          : $settings.useWebSearchInChat
-            ? `Message Pheonikz (Recon: ${activeReconLabel})...`
-            : 'Message Pheonikz...'}
+          : imageMode
+            ? `Describe an image to generate (${selectedAspectRatio})...`
+            : $settings.useWebSearchInChat
+              ? `Message Pheonikz (Recon: ${activeReconLabel}) or /image...`
+              : 'Message Pheonikz or /image...'}
         class="block w-full bg-transparent border-0 outline-none focus:ring-0 px-3 pt-2 pb-1.5 min-h-[54px] max-h-[168px] text-[15px] sm:text-sm leading-snug text-stone-100 placeholder:text-stone-500 font-prose resize-none"
       ></textarea>
 
@@ -836,6 +1069,19 @@
           </button>
           <button
             type="button"
+            onclick={() => (imageMode = !imageMode)}
+            title="Toggle Image Generation Mode (or type /image <prompt>)"
+            aria-label="Toggle Image Generation Mode"
+            aria-pressed={imageMode}
+            class="h-7 px-2 flex items-center gap-1 rounded border text-[10px] font-bold tracking-wide uppercase transition-colors cursor-pointer shrink-0 {imageMode
+              ? 'border-olive-bright/65 text-olive-bright bg-olive-drab/25'
+              : 'border-olive-drab/35 text-stone-500 hover:text-stone-300 bg-transparent'}"
+          >
+            <ImageIcon class="w-3 h-3" />
+            <span>IMG</span>
+          </button>
+          <button
+            type="button"
             onclick={() =>
               void updateSettings({ useMnemosyneInChat: !$settings.useMnemosyneInChat })}
             title="Toggle Mnemosyne OS memory"
@@ -885,11 +1131,19 @@
           {:else}
             <button
               type="submit"
-              disabled={!input.trim() && attachments.length === 0}
+              disabled={$isGeneratingImage || (!input.trim() && (imageMode || attachments.length === 0))}
               class="h-7 sm:h-8 bg-[#3d462c] hover:bg-[#4c5836] disabled:opacity-40 text-stone-100 px-2.5 sm:px-3.5 rounded text-[10.5px] font-bold tracking-wider flex items-center gap-1.5 border border-olive-bright/35 transition-all cursor-pointer"
             >
-              <span>SEND</span>
-              <SendHorizontal class="w-3 h-3 text-olive-bright" />
+              {#if $isGeneratingImage}
+                <Loader2 class="w-3 h-3 text-cyber-cyan animate-spin" />
+                <span>GEN...</span>
+              {:else if imageMode}
+                <Sparkles class="w-3 h-3 text-olive-bright" />
+                <span>GEN</span>
+              {:else}
+                <span>SEND</span>
+                <SendHorizontal class="w-3 h-3 text-olive-bright" />
+              {/if}
             </button>
           {/if}
         </div>
@@ -918,4 +1172,72 @@
       </div>
     </div>
   </div>
+
+  {#if lightboxImage && lightboxImage.url}
+    <div
+      class="fixed inset-0 z-50 bg-black/85 backdrop-blur-xs flex items-center justify-center p-3 sm:p-6"
+      role="dialog"
+      tabindex="-1"
+      aria-modal="true"
+      aria-label="Generated image preview"
+      onclick={() => (lightboxImage = null)}
+      onkeydown={(e) => {
+        if (e.key === 'Escape') lightboxImage = null;
+      }}
+    >
+      <div
+        class="max-w-4xl w-full max-h-[90dvh] rounded-lg border border-[#005a63]/70 bg-[#091517] overflow-hidden flex flex-col shadow-2xl"
+        onclick={(e) => e.stopPropagation()}
+        role="presentation"
+      >
+        <div class="px-3.5 py-2.5 border-b border-[#005a63]/40 flex items-center justify-between gap-2 text-xs">
+          <span class="font-bold uppercase tracking-wider text-cyber-cyan truncate">
+            Generated Image · {lightboxImage.aspectRatio} ({lightboxImage.size})
+          </span>
+          <div class="flex items-center gap-1.5 shrink-0">
+            {#if safeExternalUrl(lightboxImage.url)}
+              <a
+                href={safeExternalUrl(lightboxImage.url)}
+                target="_blank"
+                rel="noopener noreferrer"
+                class="h-7 px-2.5 rounded border border-[#005a63]/60 hover:border-cyber-cyan text-cyber-cyan text-[10px] font-bold uppercase inline-flex items-center gap-1"
+              >
+                <ExternalLink class="w-3 h-3" />
+                <span>Open</span>
+              </a>
+            {/if}
+            <button
+              type="button"
+              onclick={() => lightboxImage && void handleDownloadImage(lightboxImage)}
+              class="h-7 px-2.5 rounded border border-olive-bright/40 bg-[#3d462c] hover:bg-[#4c5836] text-stone-100 text-[10px] font-bold uppercase inline-flex items-center gap-1 cursor-pointer"
+            >
+              <Download class="w-3 h-3 text-olive-bright" />
+              <span>Download</span>
+            </button>
+            <button
+              type="button"
+              onclick={() => (lightboxImage = null)}
+              aria-label="Close preview"
+              class="w-7 h-7 rounded border border-olive-drab/40 hover:border-olive-bright text-stone-300 flex items-center justify-center cursor-pointer"
+            >
+              <X class="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+        <div class="flex-1 overflow-auto bg-black/50 p-2 sm:p-4 flex items-center justify-center min-h-0">
+          <img
+            src={lightboxImage.url}
+            alt={lightboxImage.prompt}
+            referrerpolicy="no-referrer"
+            class="max-w-full max-h-[72dvh] object-contain rounded"
+          />
+        </div>
+        {#if lightboxImage.revisedPrompt || lightboxImage.prompt}
+          <div class="px-3.5 py-2 border-t border-[#005a63]/30 font-prose text-xs text-cyan-100/80">
+            {lightboxImage.revisedPrompt || lightboxImage.prompt}
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
 </main>

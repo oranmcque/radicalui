@@ -23,12 +23,11 @@
     StorageMode,
     TTSProvider,
   } from '../../types/index';
-  import { safeParseJson } from '#lib/uuid';
   import {
     providers,
     refreshWorkspace,
-    serverOnline,
     settings,
+    settingsLoaded,
     storageConfig,
     updateSettings,
   } from '#lib/stores/workspace';
@@ -149,7 +148,7 @@
   } | null>(null);
 
   $effect(() => {
-    if ($serverOnline && $storageConfig && !storageSyncedInit) {
+    if ($storageConfig && !storageSyncedInit) {
       storageModeDraft = $storageConfig.mode;
       mountedPathDraft = $storageConfig.mountedPath || '/mnt/hetzner-box/pheonikz';
       remoteUrlDraft = $storageConfig.remoteUrl || '';
@@ -183,7 +182,7 @@
   let draftsSynced = $state(false);
 
   $effect(() => {
-    if ($serverOnline && $settings && !draftsSynced) {
+    if ($settingsLoaded && !draftsSynced) {
       systemPromptDraft = $settings.systemPrompt ?? '';
       fishVoiceDraft = $settings.fishVoiceId ?? '';
       searxngUrlDraft = $settings.searxngBaseUrl ?? 'http://localhost:8888';
@@ -236,18 +235,11 @@
           remoteMethod: remoteMethodDraft,
         }),
       });
-      const data = await safeParseJson<{
+      const data = (await res.json()) as {
         ok?: boolean;
         message?: string;
         latencyMs?: number;
-      }>(res);
-      if (!data) {
-        storageFeedback = {
-          ok: false,
-          message: 'Backend API unavailable (running in standalone static mode).',
-        };
-        return;
-      }
+      };
       storageFeedback = {
         ok: Boolean(res.ok && data.ok),
         message: data.message || (res.ok ? 'Storage verified.' : 'Storage check failed.'),
@@ -288,18 +280,18 @@
           preferExistingOnTarget: preferExistingDraft,
         }),
       });
-      const data = await safeParseJson<{
+      const data = (await res.json()) as {
         config?: StorageConfigPublic;
         notice?: string;
         error?: string;
-      }>(res);
-      if (data?.config) {
+      };
+      if (data.config) {
         storageConfig.set(data.config);
       }
-      if (!res.ok || !data) {
+      if (!res.ok) {
         storageFeedback = {
           ok: false,
-          message: data?.error || 'Backend API unavailable (storage config requires server mode).',
+          message: data.error || 'Failed to apply storage backend.',
         };
         return;
       }
@@ -329,19 +321,19 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ direction }),
       });
-      const data = await safeParseJson<{
+      const data = (await res.json()) as {
         ok?: boolean;
         notice?: string;
         error?: string;
         config?: StorageConfigPublic;
-      }>(res);
-      if (data?.config) {
+      };
+      if (data.config) {
         storageConfig.set(data.config);
       }
-      if (!res.ok || !data) {
+      if (!res.ok) {
         storageFeedback = {
           ok: false,
-          message: data?.error || `Backend API unavailable for storage ${direction}.`,
+          message: data.error || `Storage ${direction} failed.`,
         };
         return;
       }
@@ -371,18 +363,14 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider: providerId, apiKey: keyVal }),
       });
-      const data = await safeParseJson<{ providers?: ProviderStatus[]; error?: string }>(res);
-      if (res.ok && data?.providers) {
+      if (res.ok) {
+        const data = (await res.json()) as { providers: ProviderStatus[] };
         providers.set(data.providers);
         keyDrafts = { ...keyDrafts, [providerId]: '' };
         keyFeedback = keyVal.trim()
           ? `${providerId.toUpperCase()} credential committed to server vault.`
           : `${providerId.toUpperCase()} vault credential cleared.`;
-      } else {
-        keyFeedback = data?.error || 'Backend API unavailable (cannot save vault keys in standalone static mode).';
       }
-    } catch {
-      keyFeedback = 'Backend API unreachable (cannot save vault keys in standalone static mode).';
     } finally {
       savingKeyId = null;
     }
@@ -423,19 +411,12 @@
           maxSearchResults: clampedMax,
         }),
       });
-      const data = await safeParseJson<{
+      const data = (await res.json()) as {
         ok?: boolean;
         message?: string;
         sampleTitle?: string;
         latencyMs?: number;
-      }>(res);
-      if (!data) {
-        reconTestResult = {
-          ok: false,
-          message: 'Backend API unavailable (running in standalone static mode).',
-        };
-        return;
-      }
+      };
       reconTestResult = {
         ok: Boolean(res.ok && data.ok),
         message: data.message || (res.ok ? 'Connection verified.' : 'Connection failed.'),
@@ -474,10 +455,9 @@
           fishVoiceId: fishVoiceDraft,
         }),
       });
-      const ct = res.headers.get('content-type') || '';
-      if (!res.ok || ct.includes('text/html')) {
-        const err = await safeParseJson<{ error?: string }>(res);
-        throw new Error(err?.error || 'TTS backend unavailable in standalone static mode.');
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string };
+        throw new Error(err.error || 'Voice test failed');
       }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);

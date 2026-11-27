@@ -18,12 +18,16 @@
     activeThreadId,
     createNewThread,
     deleteThreadById,
+    initLocalSessions,
     memories,
     models,
     providers,
     refreshWorkspace,
+    saveSessionLocallyAndSync,
     selectModel,
+    selectSession,
     serverOnline,
+    sessionStorageStatus,
     settings,
     threads,
     vaultDocs,
@@ -34,6 +38,7 @@
   let mobileDrawerOpen = $state(false);
 
   onMount(() => {
+    initLocalSessions();
     void refreshWorkspace();
   });
 
@@ -54,8 +59,10 @@
         memoryCount={$memories.length}
         vaultCount={$vaultDocs.length}
         serverOnline={$serverOnline}
-        onSelectThread={(id) => activeThreadId.set(id)}
+        storageStatus={$sessionStorageStatus}
+        onSelectThread={(id) => selectSession(id)}
         onNewThread={() => void handleNewDispatch()}
+        onSaveThread={(session) => void saveSessionLocallyAndSync(session)}
         onDeleteThread={(id) => void deleteThreadById(id)}
         onCollapse={() => (desktopSidebarOpen = false)}
       />
@@ -76,8 +83,10 @@
         memoryCount={$memories.length}
         vaultCount={$vaultDocs.length}
         serverOnline={$serverOnline}
-        onSelectThread={(id) => activeThreadId.set(id)}
+        storageStatus={$sessionStorageStatus}
+        onSelectThread={(id) => selectSession(id)}
         onNewThread={() => void handleNewDispatch()}
+        onSaveThread={(session) => void saveSessionLocallyAndSync(session)}
         onDeleteThread={(id) => void deleteThreadById(id)}
         onCollapse={() => (mobileDrawerOpen = false)}
         onNavigate={() => (mobileDrawerOpen = false)}

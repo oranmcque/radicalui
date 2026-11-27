@@ -4,6 +4,7 @@ import type {
   ChatAttachment,
   ChatMessage,
   ChatThread,
+  ImageAspectRatio,
   LLMProvider,
   MnemosyneMemory,
   ModelOption,
@@ -14,7 +15,16 @@ import type {
   WebSearchSource,
   WorkspaceSettings,
 } from '../../types/index';
-import { generateUUID, safeParseJson } from '#lib/uuid';
+import {
+  chatSessionService,
+  createSafeSessionId,
+  type ChatSession,
+  type SessionStorageStatus,
+} from '#lib/services/chatSessionService';
+import {
+  generateImage,
+  resolveImageSize,
+} from '#lib/services/imageGenerationService';
 
 export const DEFAULT_SETTINGS: WorkspaceSettings = {
   activeProvider: 'gemini',
@@ -38,84 +48,21 @@ export const DEFAULT_SETTINGS: WorkspaceSettings = {
   maxSearchResults: 5,
 };
 
-export const DEFAULT_MODELS: ModelOption[] = [
-  {
-    id: 'gemini-4-hydrogen',
-    label: 'Gemini 4 Hydrogen',
-    provider: 'gemini',
-    contextWindow: '1M',
-    supportsVision: true,
-    supportsAudio: true,
-    supportsReasoning: true,
-    description: 'Fast multimodal workhorse with native vision, audio, and reasoning.',
-  },
-  {
-    id: 'gemini-3.1-flash-lite',
-    label: 'Gemini 3.1 Flash Lite',
-    provider: 'gemini',
-    contextWindow: '1M',
-    supportsVision: true,
-    supportsAudio: true,
-    supportsReasoning: false,
-    description: 'Ultra-low-latency multimodal model ideal for instant voice turns.',
-  },
-  {
-    id: 'chatgpt-4o-latest',
-    label: 'NanoGPT · ChatGPT-4o',
-    provider: 'nanogpt',
-    contextWindow: '128K',
-    supportsVision: true,
-    supportsAudio: false,
-    supportsReasoning: false,
-    description: 'Routed via NanoGPT unified OpenAI-compatible gateway.',
-  },
-  {
-    id: 'deepseek-chat',
-    label: 'DeepSeek V3',
-    provider: 'deepseek',
-    contextWindow: '128K',
-    supportsVision: false,
-    supportsAudio: false,
-    supportsReasoning: false,
-    description: 'DeepSeek flagship general and coding chat model.',
-  },
-  {
-    id: 'gpt-4o',
-    label: 'OpenAI GPT-4o',
-    provider: 'openai',
-    contextWindow: '128K',
-    supportsVision: true,
-    supportsAudio: false,
-    supportsReasoning: false,
-    description: 'OpenAI flagship multimodal chat model.',
-  },
-];
-
-export const DEFAULT_STORAGE_CONFIG: StorageConfigPublic = {
-  mode: 'local',
-  mountedPath: '',
-  remoteUrl: '',
-  remoteUsername: '',
-  hasRemotePassword: false,
-  hasRemoteToken: false,
-  remoteMethod: 'PUT',
-  autoSyncRemote: true,
-  activeStoreFile: './data/aetheris-store.json',
-  lastSyncedAt: null,
-  lastSyncError: null,
-  storeSizeBytes: 0,
-};
-
 export const threads = writable<ChatThread[]>([]);
 export const activeThreadId = writable<string | null>(null);
+export const sessionStorageStatus = writable<SessionStorageStatus>(
+  chatSessionService.getStorageStatus()
+);
 export const memories = writable<MnemosyneMemory[]>([]);
 export const vaultDocs = writable<VaultDocument[]>([]);
 export const settings = writable<WorkspaceSettings>({ ...DEFAULT_SETTINGS });
-export const storageConfig = writable<StorageConfigPublic>({ ...DEFAULT_STORAGE_CONFIG });
+export const settingsLoaded = writable<boolean>(false);
+export const storageConfig = writable<StorageConfigPublic | null>(null);
 export const providers = writable<ProviderStatus[]>([]);
-export const models = writable<ModelOption[]>([...DEFAULT_MODELS]);
-export const serverOnline = writable<boolean>(false);
+export const models = writable<ModelOption[]>([]);
+export const serverOnline = writable<boolean>(true);
 export const isStreaming = writable<boolean>(false);
+export const isGeneratingImage = writable<boolean>(false);
 export const streamingMessage = writable<{
   content: string;
   reasoning: string;
@@ -135,109 +82,121 @@ export const activeThread = derived(
 );
 
 let abortController: AbortController | null = null;
-let refreshInFlight: Promise<boolean> | null = null;
+let sessionSubscriptionsBound = false;
 
-async function safeFetchJson<T>(url: string, timeoutMs = 8000): Promise<T | null> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      cache: 'no-store',
-      signal: controller.signal,
-      headers: { Accept: 'application/json' },
+/**
+ * Loads previously persisted chat sessions from ChatSessionService
+ * and subscribes reactive stores to session and storage-mode updates.
+ */
+export function initLocalSessions(): void {
+  if (typeof window === 'undefined') return;
+  if (!sessionSubscriptionsBound) {
+    sessionSubscriptionsBound = true;
+    chatSessionService.subscribeSessions((sessions) => {
+      threads.set(sessions);
     });
-    if (!res.ok) return null;
-    return await safeParseJson<T>(res);
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
+    chatSessionService.subscribeStatus((status) => {
+      sessionStorageStatus.set(status);
+    });
+  } else {
+    threads.set(chatSessionService.listSessions());
+    sessionStorageStatus.set(chatSessionService.getStorageStatus());
+  }
+
+  const savedActiveId = chatSessionService.getActiveSessionId();
+  if (savedActiveId) {
+    activeThreadId.set(savedActiveId);
   }
 }
 
-export async function refreshWorkspace(): Promise<boolean> {
-  if (refreshInFlight) return refreshInFlight;
+export function selectSession(id: string): ChatSession | null {
+  const session = chatSessionService.getSession(id);
+  if (!session) return null;
+  chatSessionService.setActiveSessionId(session.id);
+  activeThreadId.set(session.id);
+  return session;
+}
 
-  refreshInFlight = (async () => {
-    try {
-      const [stateData, provData, storageData] = await Promise.all([
-        safeFetchJson<AppStatePayload>('/api/state', 8000),
-        safeFetchJson<{ providers: ProviderStatus[]; models: ModelOption[] }>(
-          '/api/providers/status',
-          8000
-        ),
-        safeFetchJson<StorageConfigPublic>('/api/storage/config', 8000),
-      ]);
+export async function saveSessionLocallyAndSync(
+  session: Partial<ChatSession> & { id: string }
+): Promise<ChatSession> {
+  const saved = chatSessionService.saveSession(session);
+  try {
+    await fetch(`/api/threads/${saved.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        title: saved.title,
+        provider: saved.provider,
+        model: saved.model,
+      }),
+    });
+  } catch {
+    // Local persistence already succeeded via ChatSessionService
+  }
+  return saved;
+}
 
-      if (provData) {
-        if (Array.isArray(provData.providers)) {
-          providers.set(provData.providers);
-        }
-        if (Array.isArray(provData.models) && provData.models.length > 0) {
-          models.set(provData.models);
-        }
-      }
+export async function refreshWorkspace(): Promise<void> {
+  initLocalSessions();
+  try {
+    const [stateRes, provRes, storageRes] = await Promise.all([
+      fetch('/api/state', { cache: 'no-store' }),
+      fetch('/api/providers/status', { cache: 'no-store' }),
+      fetch('/api/storage/config', { cache: 'no-store' }).catch(() => null),
+    ]);
 
-      if (storageData && typeof storageData.mode === 'string') {
-        storageConfig.set(storageData);
-      }
-
-      if (stateData && typeof stateData === 'object') {
-        if (Array.isArray(stateData.threads)) {
-          threads.set(stateData.threads);
-          const currentId = get(activeThreadId);
-          if (currentId && stateData.threads.some((t) => t.id === currentId)) {
-            activeThreadId.set(currentId);
-          } else {
-            activeThreadId.set(stateData.threads[0]?.id ?? null);
-          }
-        }
-        if (Array.isArray(stateData.memories)) {
-          memories.set(stateData.memories);
-        }
-        if (Array.isArray(stateData.vaultDocs)) {
-          vaultDocs.set(stateData.vaultDocs);
-        }
-        if (stateData.settings && typeof stateData.settings === 'object') {
-          settings.set({ ...DEFAULT_SETTINGS, ...stateData.settings });
-        }
-
-        serverOnline.set(true);
-        return true;
-      }
-
-      serverOnline.set(false);
-      return false;
-    } catch {
-      serverOnline.set(false);
-      return false;
-    } finally {
-      refreshInFlight = null;
+    if (provRes.ok) {
+      const provData = (await provRes.json()) as {
+        providers: ProviderStatus[];
+        models: ModelOption[];
+      };
+      providers.set(provData.providers);
+      models.set(provData.models);
     }
-  })();
 
-  return refreshInFlight;
+    if (storageRes && storageRes.ok) {
+      const storageData = (await storageRes.json()) as StorageConfigPublic;
+      storageConfig.set(storageData);
+    }
+
+    if (!stateRes.ok) throw new Error('State unavailable');
+    const data = (await stateRes.json()) as AppStatePayload;
+    const mergedSessions = chatSessionService.mergeSessions(data.threads);
+    threads.set(mergedSessions);
+    memories.set(data.memories);
+    vaultDocs.set(data.vaultDocs);
+    settings.set(data.settings);
+    settingsLoaded.set(true);
+
+    const currentId = get(activeThreadId) ?? chatSessionService.getActiveSessionId();
+    if (currentId && mergedSessions.some((t) => t.id === currentId)) {
+      activeThreadId.set(currentId);
+      chatSessionService.setActiveSessionId(currentId);
+    } else {
+      const nextId = mergedSessions[0]?.id ?? null;
+      activeThreadId.set(nextId);
+      chatSessionService.setActiveSessionId(nextId);
+    }
+    serverOnline.set(true);
+  } catch {
+    serverOnline.set(false);
+  }
 }
 
 export async function updateSettings(
   updates: Partial<WorkspaceSettings>
 ): Promise<void> {
   settings.update((prev) => ({ ...prev, ...updates }));
-  try {
-    const res = await fetch('/api/settings', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(updates),
-    });
-    if (res.ok) {
-      const saved = await safeParseJson<WorkspaceSettings>(res);
-      if (saved) {
-        settings.set({ ...DEFAULT_SETTINGS, ...saved });
-        serverOnline.set(true);
-      }
-    }
-  } catch {
-    // Keep optimistic client-side setting update when running statically / offline
+  const res = await fetch('/api/settings', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updates),
+  });
+  if (res.ok) {
+    const saved = (await res.json()) as WorkspaceSettings;
+    settings.set(saved);
+    settingsLoaded.set(true);
   }
 }
 
@@ -248,9 +207,15 @@ export async function selectModel(
   await updateSettings({ activeProvider: provider, activeModel: modelId });
   const tid = get(activeThreadId);
   if (tid) {
-    threads.update((prev) =>
-      prev.map((t) => (t.id === tid ? { ...t, provider, model: modelId } : t))
-    );
+    const existing = chatSessionService.getSession(tid);
+    if (existing) {
+      chatSessionService.saveSession({
+        ...existing,
+        provider,
+        model: modelId,
+        updatedAt: new Date().toISOString(),
+      });
+    }
     try {
       await fetch(`/api/threads/${tid}`, {
         method: 'PATCH',
@@ -258,7 +223,7 @@ export async function selectModel(
         body: JSON.stringify({ provider, model: modelId }),
       });
     } catch {
-      // Keep local selection when backend is unreachable
+      // Session change is already persisted locally
     }
   }
 }
@@ -275,47 +240,42 @@ export async function createNewThread(): Promise<ChatThread> {
       body: JSON.stringify({ provider, model }),
     });
     if (res.ok) {
-      const created = await safeParseJson<ChatThread>(res);
-      if (created && created.id) {
-        threads.update((prev) => [created, ...prev]);
-        activeThreadId.set(created.id);
-        serverOnline.set(true);
-        return created;
-      }
+      const created = (await res.json()) as ChatThread;
+      const saved = chatSessionService.saveSession(created);
+      chatSessionService.setActiveSessionId(saved.id);
+      activeThreadId.set(saved.id);
+      return saved;
     }
   } catch {
-    // Fall back to local thread creation in standalone static mode
+    // Fall back to local session creation via ChatSessionService
   }
 
   const now = new Date().toISOString();
-  const localThread: ChatThread = {
-    id: generateUUID(),
+  const localSaved = chatSessionService.saveSession({
+    id: createSafeSessionId(),
     title: 'New Dispatch',
     provider,
     model,
     messages: [],
     createdAt: now,
     updatedAt: now,
-  };
-  threads.update((prev) => [localThread, ...prev]);
-  activeThreadId.set(localThread.id);
-  return localThread;
+  });
+  chatSessionService.setActiveSessionId(localSaved.id);
+  activeThreadId.set(localSaved.id);
+  return localSaved;
 }
 
 export async function deleteThreadById(id: string): Promise<void> {
   const currentActive = get(activeThreadId);
-  threads.update((prev) => {
-    const remaining = prev.filter((t) => t.id !== id);
-    if (currentActive === id) {
-      activeThreadId.set(remaining[0]?.id ?? null);
-    }
-    return remaining;
-  });
-
+  chatSessionService.deleteSession(id);
+  if (currentActive === id) {
+    const nextId = chatSessionService.getActiveSessionId();
+    activeThreadId.set(nextId);
+  }
   try {
     await fetch(`/api/threads/${id}`, { method: 'DELETE' });
   } catch {
-    // Local removal already applied
+    // Local session already removed
   }
 }
 
@@ -334,19 +294,33 @@ export async function sendChatMessage(
 
   if (!options?.regenerate) {
     const optimisticUser: ChatMessage = {
-      id: generateUUID(),
+      id: createSafeSessionId(),
       role: 'user',
       content: message,
       attachments,
       createdAt: new Date().toISOString(),
     };
-    threads.update((prev) =>
-      prev.map((t) =>
-        t.id === targetThreadId
-          ? { ...t, messages: [...t.messages, optimisticUser] }
-          : t
-      )
-    );
+    const existing = chatSessionService.getSession(targetThreadId);
+    if (existing) {
+      const derivedTitle =
+        existing.title === 'New Dispatch' && message.trim()
+          ? message.trim().slice(0, 48)
+          : existing.title;
+      chatSessionService.saveSession({
+        ...existing,
+        title: derivedTitle,
+        updatedAt: optimisticUser.createdAt,
+        messages: [...existing.messages, optimisticUser],
+      });
+    } else {
+      threads.update((prev) =>
+        prev.map((t) =>
+          t.id === targetThreadId
+            ? { ...t, messages: [...t.messages, optimisticUser] }
+            : t
+        )
+      );
+    }
   }
 
   isStreaming.set(true);
@@ -370,23 +344,12 @@ export async function sendChatMessage(
     });
 
     if (!response.ok || !response.body) {
-      const errJson = await safeParseJson<{ error?: string }>(response);
-      serverOnline.set(false);
-      throw new Error(
-        errJson?.error ||
-          `Backend API unavailable (HTTP ${response.status}). Run the Express backend server to enable live LLM streaming.`
-      );
+      const errJson = (await response.json().catch(() => ({}))) as {
+        error?: string;
+      };
+      throw new Error(errJson.error || `HTTP ${response.status}`);
     }
 
-    const contentType = response.headers.get('content-type') || '';
-    if (!contentType.includes('text/event-stream')) {
-      serverOnline.set(false);
-      throw new Error(
-        'Backend /api/chat/stream did not return an event stream (static preview mode).'
-      );
-    }
-
-    serverOnline.set(true);
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -481,17 +444,27 @@ export async function sendChatMessage(
             typeof event.message !== 'string'
           ) {
             const finalMsg = event.message;
-            threads.update((prev) =>
-              prev.map((t) =>
-                t.id === targetThreadId
-                  ? {
-                      ...t,
-                      title: event.threadTitle || t.title,
-                      messages: [...t.messages, finalMsg],
-                    }
-                  : t
-              )
-            );
+            const current = chatSessionService.getSession(targetThreadId);
+            if (current) {
+              chatSessionService.saveSession({
+                ...current,
+                title: event.threadTitle || current.title,
+                updatedAt: finalMsg.createdAt || new Date().toISOString(),
+                messages: [...current.messages, finalMsg],
+              });
+            } else {
+              threads.update((prev) =>
+                prev.map((t) =>
+                  t.id === targetThreadId
+                    ? {
+                        ...t,
+                        title: event.threadTitle || t.title,
+                        messages: [...t.messages, finalMsg],
+                      }
+                    : t
+                )
+              );
+            }
           } else if (event.type === 'error') {
             throw new Error(
               typeof event.message === 'string' ? event.message : 'Stream error'
@@ -518,4 +491,148 @@ export function stopStreaming(): void {
   abortController?.abort();
   isStreaming.set(false);
   streamingMessage.set(null);
+}
+
+export async function generateChatImage(
+  prompt: string,
+  aspectRatio: ImageAspectRatio = '1:1',
+  options?: { retryMessageId?: string }
+): Promise<void> {
+  const cleanPrompt = prompt.trim();
+  if (!cleanPrompt) return;
+
+  let targetThreadId = get(activeThreadId);
+  if (!targetThreadId) {
+    const created = await createNewThread();
+    targetThreadId = created.id;
+  }
+
+  const now = new Date().toISOString();
+  const size = resolveImageSize(aspectRatio);
+  const assistantMsgId = options?.retryMessageId || createSafeSessionId();
+  const imageItemId = createSafeSessionId();
+
+  const existing = chatSessionService.getSession(targetThreadId);
+  if (existing) {
+    let nextMessages: ChatMessage[];
+    if (options?.retryMessageId) {
+      nextMessages = existing.messages.map((m) =>
+        m.id === assistantMsgId
+          ? {
+              ...m,
+              content: '',
+              generatedImage: {
+                id: imageItemId,
+                prompt: cleanPrompt,
+                aspectRatio,
+                size,
+                status: 'loading' as const,
+                createdAt: now,
+              },
+            }
+          : m
+      );
+    } else {
+      const userMsg: ChatMessage = {
+        id: createSafeSessionId(),
+        role: 'user',
+        content: `/image [${aspectRatio}] ${cleanPrompt}`,
+        createdAt: now,
+      };
+      const assistantPlaceholder: ChatMessage = {
+        id: assistantMsgId,
+        role: 'assistant',
+        content: '',
+        model: 'image-gen',
+        createdAt: now,
+        generatedImage: {
+          id: imageItemId,
+          prompt: cleanPrompt,
+          aspectRatio,
+          size,
+          status: 'loading',
+          createdAt: now,
+        },
+      };
+      nextMessages = [...existing.messages, userMsg, assistantPlaceholder];
+    }
+
+    const derivedTitle =
+      existing.title === 'New Dispatch'
+        ? `IMG: ${cleanPrompt.slice(0, 42)}`
+        : existing.title;
+
+    chatSessionService.saveSession({
+      ...existing,
+      title: derivedTitle,
+      updatedAt: now,
+      messages: nextMessages,
+    });
+  }
+
+  isGeneratingImage.set(true);
+  try {
+    const result = await generateImage({
+      prompt: cleanPrompt,
+      aspectRatio,
+      size,
+    });
+
+    const latest = chatSessionService.getSession(targetThreadId);
+    if (latest) {
+      chatSessionService.saveSession({
+        ...latest,
+        updatedAt: result.createdAt,
+        messages: latest.messages.map((m) =>
+          m.id === assistantMsgId
+            ? {
+                ...m,
+                content: result.revisedPrompt
+                  ? `Generated image (${result.aspectRatio} · ${result.size}).`
+                  : '',
+                generatedImage: {
+                  id: result.id,
+                  prompt: cleanPrompt,
+                  aspectRatio: result.aspectRatio,
+                  size: result.size,
+                  url: result.imageUrl,
+                  revisedPrompt: result.revisedPrompt,
+                  status: 'ready',
+                  createdAt: result.createdAt,
+                },
+              }
+            : m
+        ),
+      });
+    }
+  } catch (err) {
+    const errMessage =
+      err instanceof Error ? err.message : 'Image generation failed.';
+    const latest = chatSessionService.getSession(targetThreadId);
+    if (latest) {
+      chatSessionService.saveSession({
+        ...latest,
+        updatedAt: new Date().toISOString(),
+        messages: latest.messages.map((m) =>
+          m.id === assistantMsgId
+            ? {
+                ...m,
+                content: '',
+                generatedImage: {
+                  id: imageItemId,
+                  prompt: cleanPrompt,
+                  aspectRatio,
+                  size,
+                  status: 'error',
+                  error: errMessage,
+                  createdAt: now,
+                },
+              }
+            : m
+        ),
+      });
+    }
+  } finally {
+    isGeneratingImage.set(false);
+  }
 }

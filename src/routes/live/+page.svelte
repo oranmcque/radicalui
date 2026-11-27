@@ -20,7 +20,7 @@
     float32ToPcm16Base64,
   } from '#lib/audio';
   import type { MnemosyneMemory, VoicePipelineMode } from '../../types/index';
-  import { generateUUID, safeParseJson } from '#lib/uuid';
+  import { generateUUID } from '#lib/uuid';
   import {
     activeThreadId,
     refreshWorkspace,
@@ -218,13 +218,11 @@
           provider: $settings.sttProvider,
         }),
       });
-      const sttData = await safeParseJson<{
+      const sttData = (await sttRes.json()) as {
         transcript?: string;
         error?: string;
-      }>(sttRes);
-      if (!sttRes.ok || !sttData) {
-        throw new Error(sttData?.error || 'STT backend unavailable.');
-      }
+      };
+      if (!sttRes.ok) throw new Error(sttData.error || 'STT failed');
       const userText = (sttData.transcript || '').trim();
       if (!userText) {
         vadState = 'listening';
@@ -265,10 +263,7 @@
             })}`,
           }),
         });
-        const tData = await safeParseJson<{ id?: string }>(tRes);
-        if (!tRes.ok || !tData?.id) {
-          throw new Error('Backend API unavailable for live voice threads.');
-        }
+        const tData = (await tRes.json()) as { id: string };
         modularThreadId = tData.id;
       }
 
@@ -284,9 +279,8 @@
           useWebSearch: $settings.useWebSearchInChat,
         }),
       });
-      const chatContentType = chatRes.headers.get('content-type') || '';
-      if (!chatRes.ok || !chatRes.body || chatContentType.includes('text/html')) {
-        throw new Error('Backend chat stream unavailable.');
+      if (!chatRes.ok || !chatRes.body) {
+        throw new Error('LLM stream failed');
       }
 
     const reader = chatRes.body.getReader();
@@ -384,12 +378,13 @@
         provider: $settings.ttsProvider,
       }),
     });
-    const ttsContentType = ttsRes.headers.get('content-type') || '';
-    if (!ttsRes.ok || ttsContentType.includes('text/html')) {
-      const errData = await safeParseJson<{ error?: string }>(ttsRes);
+    if (!ttsRes.ok) {
+      const errData = (await ttsRes.json().catch(() => ({}))) as {
+        error?: string;
+      };
       aiSpeaking = false;
       vadState = 'listening';
-      throw new Error(errData?.error || 'TTS backend unavailable.');
+      throw new Error(errData.error || 'TTS failed');
     }
 
     const audioBlob = await ttsRes.blob();
@@ -654,15 +649,13 @@
           }),
         });
         if (res.ok) {
-          const data = await safeParseJson<{ thread?: { id: string } }>(res);
+          const data = (await res.json()) as { thread?: { id: string } };
           await refreshWorkspace();
-          if (data?.thread?.id) {
+          if (data.thread?.id) {
             activeThreadId.set(data.thread.id);
             await goto('/');
           }
         }
-      } catch {
-        errorMessage = 'Call ended locally (backend log endpoint unavailable).';
       } finally {
         savingCall = false;
       }

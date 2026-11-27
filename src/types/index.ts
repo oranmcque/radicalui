@@ -89,6 +89,20 @@ export interface WebSearchSource {
   provider?: string;
 }
 
+export type ImageAspectRatio = '1:1' | '16:9' | '9:16' | '4:3' | '3:4';
+
+export interface GeneratedImageItem {
+  id: string;
+  prompt: string;
+  aspectRatio: ImageAspectRatio;
+  size: string;
+  url?: string;
+  revisedPrompt?: string;
+  status: 'loading' | 'ready' | 'error';
+  error?: string;
+  createdAt: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
@@ -102,6 +116,7 @@ export interface ChatMessage {
   webSearchQuery?: string;
   webSearchProvider?: SearchProvider;
   webSources?: WebSearchSource[];
+  generatedImage?: GeneratedImageItem;
   createdAt: string;
 }
 
