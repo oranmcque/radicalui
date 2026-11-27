@@ -23,9 +23,11 @@
     StorageMode,
     TTSProvider,
   } from '../../types/index';
+  import { safeParseJson } from '#lib/uuid';
   import {
     providers,
     refreshWorkspace,
+    serverOnline,
     settings,
     storageConfig,
     updateSettings,
@@ -147,7 +149,7 @@
   } | null>(null);
 
   $effect(() => {
-    if ($storageConfig && !storageSyncedInit) {
+    if ($serverOnline && $storageConfig && !storageSyncedInit) {
       storageModeDraft = $storageConfig.mode;
       mountedPathDraft = $storageConfig.mountedPath || '/mnt/hetzner-box/pheonikz';
       remoteUrlDraft = $storageConfig.remoteUrl || '';
@@ -181,7 +183,7 @@
   let draftsSynced = $state(false);
 
   $effect(() => {
-    if ($settings && !draftsSynced) {
+    if ($serverOnline && $settings && !draftsSynced) {
       systemPromptDraft = $settings.systemPrompt ?? '';
       fishVoiceDraft = $settings.fishVoiceId ?? '';
       searxngUrlDraft = $settings.searxngBaseUrl ?? 'http://localhost:8888';
@@ -234,11 +236,18 @@
           remoteMethod: remoteMethodDraft,
         }),
       });
-      const data = (await res.json()) as {
+      const data = await safeParseJson<{
         ok?: boolean;
         message?: string;
         latencyMs?: number;
-      };
+      }>(res);
+      if (!data) {
+        storageFeedback = {
+          ok: false,
+          message: 'Backend API unavailable (running in standalone static mode).',
+        };
+        return;
+      }
       storageFeedback = {
         ok: Boolean(res.ok && data.ok),
         message: data.message || (res.ok ? 'Storage verified.' : 'Storage check failed.'),
@@ -279,18 +288,18 @@
           preferExistingOnTarget: preferExistingDraft,
         }),
       });
-      const data = (await res.json()) as {
+      const data = await safeParseJson<{
         config?: StorageConfigPublic;
         notice?: string;
         error?: string;
-      };
-      if (data.config) {
+      }>(res);
+      if (data?.config) {
         storageConfig.set(data.config);
       }
-      if (!res.ok) {
+      if (!res.ok || !data) {
         storageFeedback = {
           ok: false,
-          message: data.error || 'Failed to apply storage backend.',
+          message: data?.error || 'Backend API unavailable (storage config requires server mode).',
         };
         return;
       }
@@ -320,19 +329,19 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ direction }),
       });
-      const data = (await res.json()) as {
+      const data = await safeParseJson<{
         ok?: boolean;
         notice?: string;
         error?: string;
         config?: StorageConfigPublic;
-      };
-      if (data.config) {
+      }>(res);
+      if (data?.config) {
         storageConfig.set(data.config);
       }
-      if (!res.ok) {
+      if (!res.ok || !data) {
         storageFeedback = {
           ok: false,
-          message: data.error || `Storage ${direction} failed.`,
+          message: data?.error || `Backend API unavailable for storage ${direction}.`,
         };
         return;
       }
@@ -362,14 +371,18 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider: providerId, apiKey: keyVal }),
       });
-      if (res.ok) {
-        const data = (await res.json()) as { providers: ProviderStatus[] };
+      const data = await safeParseJson<{ providers?: ProviderStatus[]; error?: string }>(res);
+      if (res.ok && data?.providers) {
         providers.set(data.providers);
         keyDrafts = { ...keyDrafts, [providerId]: '' };
         keyFeedback = keyVal.trim()
           ? `${providerId.toUpperCase()} credential committed to server vault.`
           : `${providerId.toUpperCase()} vault credential cleared.`;
+      } else {
+        keyFeedback = data?.error || 'Backend API unavailable (cannot save vault keys in standalone static mode).';
       }
+    } catch {
+      keyFeedback = 'Backend API unreachable (cannot save vault keys in standalone static mode).';
     } finally {
       savingKeyId = null;
     }
@@ -389,7 +402,6 @@
   }
 
   async function handleTestReconConnection() {
-    if (!$settings) return;
     testingRecon = true;
     reconTestResult = null;
     try {
@@ -411,12 +423,19 @@
           maxSearchResults: clampedMax,
         }),
       });
-      const data = (await res.json()) as {
+      const data = await safeParseJson<{
         ok?: boolean;
         message?: string;
         sampleTitle?: string;
         latencyMs?: number;
-      };
+      }>(res);
+      if (!data) {
+        reconTestResult = {
+          ok: false,
+          message: 'Backend API unavailable (running in standalone static mode).',
+        };
+        return;
+      }
       reconTestResult = {
         ok: Boolean(res.ok && data.ok),
         message: data.message || (res.ok ? 'Connection verified.' : 'Connection failed.'),
@@ -443,7 +462,6 @@
   }
 
   async function handleTestSpeech() {
-    if (!$settings) return;
     testError = null;
     testingTts = true;
     try {
@@ -456,9 +474,10 @@
           fishVoiceId: fishVoiceDraft,
         }),
       });
-      if (!res.ok) {
-        const err = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(err.error || 'Voice test failed');
+      const ct = res.headers.get('content-type') || '';
+      if (!res.ok || ct.includes('text/html')) {
+        const err = await safeParseJson<{ error?: string }>(res);
+        throw new Error(err?.error || 'TTS backend unavailable in standalone static mode.');
       }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
@@ -473,7 +492,6 @@
   }
 </script>
 
-{#if $settings}
   <div class="flex-1 overflow-y-auto px-2.5 sm:px-8 py-3 sm:py-6 bg-[#0a0b08] relative font-mono">
     <div class="absolute inset-0 pointer-events-none crt-scanlines opacity-15"></div>
 
@@ -1451,4 +1469,3 @@
       </section>
     </div>
   </div>
-{/if}

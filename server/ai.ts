@@ -11,8 +11,8 @@ import type {
   STTProvider,
   TTSProvider,
   WebSearchSource,
-} from '../src/types/index.js';
-import { addMemory, loadState, resolveProviderKey } from './store.js';
+} from '../src/types/index.ts';
+import { addMemory, loadState, resolveProviderKey } from './store.ts';
 
 export function getGeminiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;

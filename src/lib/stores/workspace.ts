@@ -14,16 +14,107 @@ import type {
   WebSearchSource,
   WorkspaceSettings,
 } from '../../types/index';
+import { generateUUID, safeParseJson } from '#lib/uuid';
+
+export const DEFAULT_SETTINGS: WorkspaceSettings = {
+  activeProvider: 'gemini',
+  activeModel: 'gemini-4-hydrogen',
+  voicePipeline: 'gemini-live',
+  sttProvider: 'gemini',
+  ttsProvider: 'gemini',
+  fishVoiceId: '',
+  deepgramSttModel: 'nova-2',
+  deepgramTtsVoice: 'aura-asteria-en',
+  geminiVoice: 'Zephyr',
+  systemPrompt:
+    'You are Pheonikz UI, a self-hosted multimodal intelligence running inside Mnemosyne OS. Be direct, technically rigorous, and leverage recalled memories naturally without reciting memory IDs unless asked.',
+  autoConsolidateMemory: true,
+  useMnemosyneInChat: true,
+  useWebSearchInChat: true,
+  searchProvider: 'gemini-native',
+  searxngBaseUrl: 'http://localhost:8888',
+  customSearchUrl: '',
+  customSearchMethod: 'GET',
+  maxSearchResults: 5,
+};
+
+export const DEFAULT_MODELS: ModelOption[] = [
+  {
+    id: 'gemini-4-hydrogen',
+    label: 'Gemini 4 Hydrogen',
+    provider: 'gemini',
+    contextWindow: '1M',
+    supportsVision: true,
+    supportsAudio: true,
+    supportsReasoning: true,
+    description: 'Fast multimodal workhorse with native vision, audio, and reasoning.',
+  },
+  {
+    id: 'gemini-3.1-flash-lite',
+    label: 'Gemini 3.1 Flash Lite',
+    provider: 'gemini',
+    contextWindow: '1M',
+    supportsVision: true,
+    supportsAudio: true,
+    supportsReasoning: false,
+    description: 'Ultra-low-latency multimodal model ideal for instant voice turns.',
+  },
+  {
+    id: 'chatgpt-4o-latest',
+    label: 'NanoGPT · ChatGPT-4o',
+    provider: 'nanogpt',
+    contextWindow: '128K',
+    supportsVision: true,
+    supportsAudio: false,
+    supportsReasoning: false,
+    description: 'Routed via NanoGPT unified OpenAI-compatible gateway.',
+  },
+  {
+    id: 'deepseek-chat',
+    label: 'DeepSeek V3',
+    provider: 'deepseek',
+    contextWindow: '128K',
+    supportsVision: false,
+    supportsAudio: false,
+    supportsReasoning: false,
+    description: 'DeepSeek flagship general and coding chat model.',
+  },
+  {
+    id: 'gpt-4o',
+    label: 'OpenAI GPT-4o',
+    provider: 'openai',
+    contextWindow: '128K',
+    supportsVision: true,
+    supportsAudio: false,
+    supportsReasoning: false,
+    description: 'OpenAI flagship multimodal chat model.',
+  },
+];
+
+export const DEFAULT_STORAGE_CONFIG: StorageConfigPublic = {
+  mode: 'local',
+  mountedPath: '',
+  remoteUrl: '',
+  remoteUsername: '',
+  hasRemotePassword: false,
+  hasRemoteToken: false,
+  remoteMethod: 'PUT',
+  autoSyncRemote: true,
+  activeStoreFile: './data/aetheris-store.json',
+  lastSyncedAt: null,
+  lastSyncError: null,
+  storeSizeBytes: 0,
+};
 
 export const threads = writable<ChatThread[]>([]);
 export const activeThreadId = writable<string | null>(null);
 export const memories = writable<MnemosyneMemory[]>([]);
 export const vaultDocs = writable<VaultDocument[]>([]);
-export const settings = writable<WorkspaceSettings | null>(null);
-export const storageConfig = writable<StorageConfigPublic | null>(null);
+export const settings = writable<WorkspaceSettings>({ ...DEFAULT_SETTINGS });
+export const storageConfig = writable<StorageConfigPublic>({ ...DEFAULT_STORAGE_CONFIG });
 export const providers = writable<ProviderStatus[]>([]);
-export const models = writable<ModelOption[]>([]);
-export const serverOnline = writable<boolean>(true);
+export const models = writable<ModelOption[]>([...DEFAULT_MODELS]);
+export const serverOnline = writable<boolean>(false);
 export const isStreaming = writable<boolean>(false);
 export const streamingMessage = writable<{
   content: string;
@@ -44,62 +135,109 @@ export const activeThread = derived(
 );
 
 let abortController: AbortController | null = null;
+let refreshInFlight: Promise<boolean> | null = null;
 
-export async function refreshWorkspace(): Promise<void> {
+async function safeFetchJson<T>(url: string, timeoutMs = 8000): Promise<T | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const [stateRes, provRes, storageRes] = await Promise.all([
-      fetch('/api/state'),
-      fetch('/api/providers/status'),
-      fetch('/api/storage/config'),
-    ]);
-
-    if (stateRes.ok) {
-      const stateData = (await stateRes.json()) as AppStatePayload;
-      threads.set(stateData.threads);
-      memories.set(stateData.memories);
-      vaultDocs.set(stateData.vaultDocs);
-      settings.set(stateData.settings);
-
-      const currentId = get(activeThreadId);
-      if (currentId && stateData.threads.some((t) => t.id === currentId)) {
-        activeThreadId.set(currentId);
-      } else {
-        activeThreadId.set(stateData.threads[0]?.id ?? null);
-      }
-    }
-
-    if (provRes.ok) {
-      const provData = (await provRes.json()) as {
-        providers: ProviderStatus[];
-        models: ModelOption[];
-      };
-      providers.set(provData.providers);
-      models.set(provData.models);
-    }
-
-    if (storageRes.ok) {
-      const stData = (await storageRes.json()) as StorageConfigPublic;
-      storageConfig.set(stData);
-    }
-
-    serverOnline.set(stateRes.ok && provRes.ok);
+    const res = await fetch(url, {
+      cache: 'no-store',
+      signal: controller.signal,
+      headers: { Accept: 'application/json' },
+    });
+    if (!res.ok) return null;
+    return await safeParseJson<T>(res);
   } catch {
-    serverOnline.set(false);
+    return null;
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+export async function refreshWorkspace(): Promise<boolean> {
+  if (refreshInFlight) return refreshInFlight;
+
+  refreshInFlight = (async () => {
+    try {
+      const [stateData, provData, storageData] = await Promise.all([
+        safeFetchJson<AppStatePayload>('/api/state', 8000),
+        safeFetchJson<{ providers: ProviderStatus[]; models: ModelOption[] }>(
+          '/api/providers/status',
+          8000
+        ),
+        safeFetchJson<StorageConfigPublic>('/api/storage/config', 8000),
+      ]);
+
+      if (provData) {
+        if (Array.isArray(provData.providers)) {
+          providers.set(provData.providers);
+        }
+        if (Array.isArray(provData.models) && provData.models.length > 0) {
+          models.set(provData.models);
+        }
+      }
+
+      if (storageData && typeof storageData.mode === 'string') {
+        storageConfig.set(storageData);
+      }
+
+      if (stateData && typeof stateData === 'object') {
+        if (Array.isArray(stateData.threads)) {
+          threads.set(stateData.threads);
+          const currentId = get(activeThreadId);
+          if (currentId && stateData.threads.some((t) => t.id === currentId)) {
+            activeThreadId.set(currentId);
+          } else {
+            activeThreadId.set(stateData.threads[0]?.id ?? null);
+          }
+        }
+        if (Array.isArray(stateData.memories)) {
+          memories.set(stateData.memories);
+        }
+        if (Array.isArray(stateData.vaultDocs)) {
+          vaultDocs.set(stateData.vaultDocs);
+        }
+        if (stateData.settings && typeof stateData.settings === 'object') {
+          settings.set({ ...DEFAULT_SETTINGS, ...stateData.settings });
+        }
+
+        serverOnline.set(true);
+        return true;
+      }
+
+      serverOnline.set(false);
+      return false;
+    } catch {
+      serverOnline.set(false);
+      return false;
+    } finally {
+      refreshInFlight = null;
+    }
+  })();
+
+  return refreshInFlight;
 }
 
 export async function updateSettings(
   updates: Partial<WorkspaceSettings>
 ): Promise<void> {
-  settings.update((prev) => (prev ? { ...prev, ...updates } : prev));
-  const res = await fetch('/api/settings', {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(updates),
-  });
-  if (res.ok) {
-    const saved = (await res.json()) as WorkspaceSettings;
-    settings.set(saved);
+  settings.update((prev) => ({ ...prev, ...updates }));
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    });
+    if (res.ok) {
+      const saved = await safeParseJson<WorkspaceSettings>(res);
+      if (saved) {
+        settings.set({ ...DEFAULT_SETTINGS, ...saved });
+        serverOnline.set(true);
+      }
+    }
+  } catch {
+    // Keep optimistic client-side setting update when running statically / offline
   }
 }
 
@@ -110,35 +248,61 @@ export async function selectModel(
   await updateSettings({ activeProvider: provider, activeModel: modelId });
   const tid = get(activeThreadId);
   if (tid) {
-    await fetch(`/api/threads/${tid}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ provider, model: modelId }),
-    });
     threads.update((prev) =>
       prev.map((t) => (t.id === tid ? { ...t, provider, model: modelId } : t))
     );
+    try {
+      await fetch(`/api/threads/${tid}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider, model: modelId }),
+      });
+    } catch {
+      // Keep local selection when backend is unreachable
+    }
   }
 }
 
-export async function createNewThread(): Promise<ChatThread | null> {
+export async function createNewThread(): Promise<ChatThread> {
   const s = get(settings);
-  const provider = s?.activeProvider || 'gemini';
-  const model = s?.activeModel || 'gemini-4-hydrogen';
-  const res = await fetch('/api/threads', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ provider, model }),
-  });
-  if (!res.ok) return null;
-  const created = (await res.json()) as ChatThread;
-  threads.update((prev) => [created, ...prev]);
-  activeThreadId.set(created.id);
-  return created;
+  const provider = s.activeProvider || 'gemini';
+  const model = s.activeModel || 'gemini-4-hydrogen';
+
+  try {
+    const res = await fetch('/api/threads', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider, model }),
+    });
+    if (res.ok) {
+      const created = await safeParseJson<ChatThread>(res);
+      if (created && created.id) {
+        threads.update((prev) => [created, ...prev]);
+        activeThreadId.set(created.id);
+        serverOnline.set(true);
+        return created;
+      }
+    }
+  } catch {
+    // Fall back to local thread creation in standalone static mode
+  }
+
+  const now = new Date().toISOString();
+  const localThread: ChatThread = {
+    id: generateUUID(),
+    title: 'New Dispatch',
+    provider,
+    model,
+    messages: [],
+    createdAt: now,
+    updatedAt: now,
+  };
+  threads.update((prev) => [localThread, ...prev]);
+  activeThreadId.set(localThread.id);
+  return localThread;
 }
 
 export async function deleteThreadById(id: string): Promise<void> {
-  await fetch(`/api/threads/${id}`, { method: 'DELETE' });
   const currentActive = get(activeThreadId);
   threads.update((prev) => {
     const remaining = prev.filter((t) => t.id !== id);
@@ -147,6 +311,12 @@ export async function deleteThreadById(id: string): Promise<void> {
     }
     return remaining;
   });
+
+  try {
+    await fetch(`/api/threads/${id}`, { method: 'DELETE' });
+  } catch {
+    // Local removal already applied
+  }
 }
 
 export async function sendChatMessage(
@@ -155,18 +325,16 @@ export async function sendChatMessage(
   options?: { regenerate?: boolean }
 ): Promise<void> {
   const s = get(settings);
-  if (!s) return;
 
   let targetThreadId = get(activeThreadId);
   if (!targetThreadId) {
     const created = await createNewThread();
-    if (!created) return;
     targetThreadId = created.id;
   }
 
   if (!options?.regenerate) {
     const optimisticUser: ChatMessage = {
-      id: crypto.randomUUID(),
+      id: generateUUID(),
       role: 'user',
       content: message,
       attachments,
@@ -202,9 +370,23 @@ export async function sendChatMessage(
     });
 
     if (!response.ok || !response.body) {
-      throw new Error('Failed to connect to streaming endpoint.');
+      const errJson = await safeParseJson<{ error?: string }>(response);
+      serverOnline.set(false);
+      throw new Error(
+        errJson?.error ||
+          `Backend API unavailable (HTTP ${response.status}). Run the Express backend server to enable live LLM streaming.`
+      );
     }
 
+    const contentType = response.headers.get('content-type') || '';
+    if (!contentType.includes('text/event-stream')) {
+      serverOnline.set(false);
+      throw new Error(
+        'Backend /api/chat/stream did not return an event stream (static preview mode).'
+      );
+    }
+
+    serverOnline.set(true);
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';

@@ -1,0 +1,313 @@
+{
+  ".svelte-kit/generated/build/env/config.js": {
+    "file": "env.js",
+    "name": "env",
+    "src": ".svelte-kit/generated/build/env/config.js",
+    "isEntry": true
+  },
+  "_brain.js": {
+    "file": "chunks/brain.js",
+    "name": "brain",
+    "imports": [
+      "_server.js",
+      "_workspace.js"
+    ]
+  },
+  "_chevron-down.js": {
+    "file": "chunks/chevron-down.js",
+    "name": "chevron-down",
+    "imports": [
+      "_server.js",
+      "_workspace.js"
+    ]
+  },
+  "_database.js": {
+    "file": "chunks/database.js",
+    "name": "database",
+    "imports": [
+      "_server.js",
+      "_workspace.js"
+    ]
+  },
+  "_file-text.js": {
+    "file": "chunks/file-text.js",
+    "name": "file-text",
+    "imports": [
+      "_server.js",
+      "_workspace.js"
+    ]
+  },
+  "_functions.js": {
+    "file": "chunks/functions.js",
+    "name": "functions",
+    "imports": [
+      "_server-errors.js"
+    ]
+  },
+  "_globe.js": {
+    "file": "chunks/globe.js",
+    "name": "globe",
+    "imports": [
+      "_server.js",
+      "_workspace.js"
+    ]
+  },
+  "_index-server.js": {
+    "file": "chunks/index-server.js",
+    "name": "index-server",
+    "imports": [
+      "_server.js"
+    ]
+  },
+  "_internal.js": {
+    "file": "chunks/internal.js",
+    "name": "internal",
+    "imports": [
+      "_server-errors.js",
+      "_functions.js"
+    ]
+  },
+  "_key-round.js": {
+    "file": "chunks/key-round.js",
+    "name": "key-round",
+    "imports": [
+      "_server.js",
+      "_workspace.js"
+    ]
+  },
+  "_navigation.js": {
+    "file": "chunks/navigation.js",
+    "name": "navigation",
+    "imports": [
+      "_functions.js"
+    ]
+  },
+  "_plus.js": {
+    "file": "chunks/plus.js",
+    "name": "plus",
+    "imports": [
+      "_server.js",
+      "_workspace.js"
+    ]
+  },
+  "_radio.js": {
+    "file": "chunks/radio.js",
+    "name": "radio",
+    "imports": [
+      "_server.js",
+      "_workspace.js"
+    ]
+  },
+  "_search.js": {
+    "file": "chunks/search.js",
+    "name": "search",
+    "imports": [
+      "_server.js",
+      "_workspace.js"
+    ]
+  },
+  "_send-horizontal.js": {
+    "file": "chunks/send-horizontal.js",
+    "name": "send-horizontal",
+    "imports": [
+      "_server.js",
+      "_workspace.js"
+    ]
+  },
+  "_server-errors.js": {
+    "file": "chunks/server-errors.js",
+    "name": "server-errors"
+  },
+  "_server.js": {
+    "file": "chunks/server.js",
+    "name": "server"
+  },
+  "_state.js": {
+    "file": "chunks/state.js",
+    "name": "state",
+    "imports": [
+      "_index-server.js",
+      "_server.js",
+      "_server-errors.js"
+    ]
+  },
+  "_trash-2.js": {
+    "file": "chunks/trash-2.js",
+    "name": "trash-2",
+    "imports": [
+      "_server.js",
+      "_workspace.js"
+    ]
+  },
+  "_workspace.js": {
+    "file": "chunks/workspace.js",
+    "name": "workspace",
+    "imports": [
+      "_server.js"
+    ]
+  },
+  "_x.js": {
+    "file": "chunks/x.js",
+    "name": "x",
+    "imports": [
+      "_server.js",
+      "_workspace.js"
+    ]
+  },
+  "node_modules/@sveltejs/kit/src/runtime/app/server/remote/index.js": {
+    "file": "remote-entry.js",
+    "name": "remote-entry",
+    "src": "node_modules/@sveltejs/kit/src/runtime/app/server/remote/index.js",
+    "isEntry": true,
+    "imports": [
+      "_server-errors.js",
+      "_internal.js",
+      "_functions.js"
+    ]
+  },
+  "node_modules/@sveltejs/kit/src/runtime/components/error.svelte": {
+    "file": "entries/fallbacks/error.svelte.js",
+    "name": "entries/fallbacks/error.svelte",
+    "src": "node_modules/@sveltejs/kit/src/runtime/components/error.svelte",
+    "isEntry": true,
+    "imports": [
+      "_server.js",
+      "_state.js"
+    ]
+  },
+  "node_modules/@sveltejs/kit/src/runtime/server/index.js": {
+    "file": "index.js",
+    "name": "index",
+    "src": "node_modules/@sveltejs/kit/src/runtime/server/index.js",
+    "isEntry": true,
+    "imports": [
+      "_internal.js"
+    ],
+    "dynamicImports": [
+      "node_modules/@sveltejs/kit/src/runtime/server/instance.js"
+    ]
+  },
+  "node_modules/@sveltejs/kit/src/runtime/server/instance.js": {
+    "file": "chunks/instance.js",
+    "name": "instance",
+    "src": "node_modules/@sveltejs/kit/src/runtime/server/instance.js",
+    "isDynamicEntry": true,
+    "imports": [
+      "_functions.js",
+      "_internal.js",
+      "_server-errors.js",
+      ".svelte-kit/generated/build/env/config.js",
+      "_server.js",
+      "_navigation.js"
+    ]
+  },
+  "src/routes/+layout.svelte": {
+    "file": "entries/pages/_layout.svelte.js",
+    "name": "entries/pages/_layout.svelte",
+    "src": "src/routes/+layout.svelte",
+    "isEntry": true,
+    "imports": [
+      "_server.js",
+      "_index-server.js",
+      "_navigation.js",
+      "_state.js",
+      "_brain.js",
+      "_globe.js",
+      "_key-round.js",
+      "_workspace.js",
+      "_radio.js",
+      "_plus.js",
+      "_search.js",
+      "_trash-2.js",
+      "_chevron-down.js"
+    ],
+    "css": [
+      "_app/immutable/assets/_layout.BI25SpGI.css"
+    ]
+  },
+  "src/routes/+layout.ts": {
+    "file": "entries/pages/_layout.ts.js",
+    "name": "entries/pages/_layout.ts",
+    "src": "src/routes/+layout.ts",
+    "isEntry": true
+  },
+  "src/routes/+page.svelte": {
+    "file": "entries/pages/_page.svelte.js",
+    "name": "entries/pages/_page.svelte",
+    "src": "src/routes/+page.svelte",
+    "isEntry": true,
+    "imports": [
+      "_server.js",
+      "_brain.js",
+      "_chevron-down.js",
+      "_workspace.js",
+      "_file-text.js",
+      "_globe.js",
+      "_radio.js",
+      "_send-horizontal.js",
+      "_x.js"
+    ],
+    "css": [
+      "_app/immutable/assets/_page.3E8lVIPF.css"
+    ]
+  },
+  "src/routes/live/+page.svelte": {
+    "file": "entries/pages/live/_page.svelte.js",
+    "name": "entries/pages/live/_page.svelte",
+    "src": "src/routes/live/+page.svelte",
+    "isEntry": true,
+    "imports": [
+      "_server.js",
+      "_index-server.js",
+      "_navigation.js",
+      "_brain.js",
+      "_workspace.js",
+      "_radio.js",
+      "_send-horizontal.js"
+    ]
+  },
+  "src/routes/mnemosyne/+page.svelte": {
+    "file": "entries/pages/mnemosyne/_page.svelte.js",
+    "name": "entries/pages/mnemosyne/_page.svelte",
+    "src": "src/routes/mnemosyne/+page.svelte",
+    "isEntry": true,
+    "imports": [
+      "_server.js",
+      "_brain.js",
+      "_database.js",
+      "_workspace.js",
+      "_plus.js",
+      "_search.js",
+      "_trash-2.js",
+      "_x.js"
+    ]
+  },
+  "src/routes/search/+page.svelte": {
+    "file": "entries/pages/search/_page.svelte.js",
+    "name": "entries/pages/search/_page.svelte",
+    "src": "src/routes/search/+page.svelte",
+    "isEntry": true,
+    "imports": [
+      "_server.js",
+      "_navigation.js",
+      "_database.js",
+      "_file-text.js",
+      "_globe.js",
+      "_workspace.js",
+      "_search.js"
+    ]
+  },
+  "src/routes/vault/+page.svelte": {
+    "file": "entries/pages/vault/_page.svelte.js",
+    "name": "entries/pages/vault/_page.svelte",
+    "src": "src/routes/vault/+page.svelte",
+    "isEntry": true,
+    "imports": [
+      "_server.js",
+      "_workspace.js",
+      "_key-round.js",
+      "_trash-2.js",
+      "_globe.js"
+    ]
+  }
+}

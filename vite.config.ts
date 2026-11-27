@@ -64,5 +64,9 @@ export default defineConfig({
   server: {
     hmr: false,
     watch: null,
+    allowedHosts: true,
+  },
+  preview: {
+    allowedHosts: true,
   },
 });

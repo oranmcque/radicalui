@@ -16,7 +16,7 @@ import type {
   StorageMode,
   TTSProvider,
   WebSearchSource,
-} from './src/types/index.js';
+} from './src/types/index.ts';
 import {
   MODEL_CATALOG,
   consolidateMemoriesFromTurn,
@@ -24,13 +24,13 @@ import {
   streamChatCompletion,
   synthesizeSpeech,
   transcribeAudio,
-} from './server/ai.js';
+} from './server/ai.ts';
 import {
   executeWebReconSearch,
   formatWebSearchSystemBlock,
   parallelWebFetch,
   testSearchProviderConnection,
-} from './server/search.js';
+} from './server/search.ts';
 import {
   getPublicStorageConfig,
   loadStorageConfig,
@@ -41,8 +41,8 @@ import {
   validateMountedPath,
   validateRemoteStorageUrl,
   writeFileAtomic,
-} from './server/storage.js';
-import { attachWebSocketServers } from './server/live.js';
+} from './server/storage.ts';
+import { attachWebSocketServers } from './server/live.ts';
 import {
   addMemory,
   addVaultDocument,
@@ -64,9 +64,9 @@ import {
   updateSettings,
   updateThreadMeta,
   type VaultKeyProvider,
-} from './server/store.js';
+} from './server/store.ts';
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 async function startServer() {
   const app = express();
@@ -75,11 +75,42 @@ async function startServer() {
   app.use(express.json({ limit: '25mb' }));
 
   // Health & Provider Status (read-only env/vault readiness; never returns secret values)
-  app.get('/api/providers/status', (_req, res) => {
+  const distDir = path.resolve(process.cwd(), 'dist');
+  const distIndex = path.join(distDir, 'index.html');
+  const hasDistBuild = () => fs.existsSync(distIndex);
+  const preferStaticDist =
+    (process.env.NODE_ENV === 'production' || process.env.SERVE_STATIC === 'true') &&
+    hasDistBuild();
+
+  const viteState: { server: ViteDevServer | null; error: Error | null } = {
+    server: null,
+    error: null,
+  };
+
+  app.get('/api/health', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     res.json({
-      providers: getProviderStatuses(),
-      models: MODEL_CATALOG,
+      ok: true,
+      mode: preferStaticDist ? 'static' : 'dev',
+      viteReady: preferStaticDist || Boolean(viteState.server),
+      viteError: viteState.error ? viteState.error.message : null,
+      distAvailable: hasDistBuild(),
+      uptimeSec: Math.round(process.uptime()),
     });
+  });
+
+  app.get('/api/providers/status', (_req, res) => {
+    try {
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({
+        providers: getProviderStatuses(),
+        models: MODEL_CATALOG,
+      });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to load provider status',
+      });
+    }
   });
 
   // Save/Clear server-persisted 3rd-party API credentials (write-only; returns masked status)
@@ -112,18 +143,38 @@ async function startServer() {
 
   // Full initial workspace state (never includes raw keys)
   app.get('/api/state', (_req, res) => {
-    res.json(getPublicAppState());
+    try {
+      res.setHeader('Cache-Control', 'no-store');
+      res.json(getPublicAppState());
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to load workspace state',
+      });
+    }
   });
 
   // Settings
   app.patch('/api/settings', (req, res) => {
-    const updated = updateSettings(req.body ?? {});
-    res.json(updated);
+    try {
+      const updated = updateSettings(req.body ?? {});
+      res.json(updated);
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to update settings',
+      });
+    }
   });
 
   // Persistent Storage Backend (Local, Mounted Hetzner Storage Box, WebDAV, External HTTP)
   app.get('/api/storage/config', (_req, res) => {
-    res.json(getPublicStorageConfig());
+    try {
+      res.setHeader('Cache-Control', 'no-store');
+      res.json(getPublicStorageConfig());
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to load storage config',
+      });
+    }
   });
 
   app.post('/api/storage/test', async (req, res) => {
@@ -879,17 +930,34 @@ async function startServer() {
     res.json({ deleted: true });
   });
 
+  // Ensure unknown /api/* routes always return JSON instead of SPA HTML
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found.' });
+  });
+
   // Attach WebSockets for Live Call (/ws/live-call) & Deepgram Streaming STT (/ws/deepgram-stt)
   attachWebSocketServers(server);
+
+  const staticFilesMiddleware = express.static(distDir);
+  const serveStaticFallback = (
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction
+  ) => {
+    staticFilesMiddleware(req, res, () => {
+      if (hasDistBuild()) {
+        res.setHeader('Cache-Control', 'no-cache');
+        res.sendFile(distIndex);
+        return;
+      }
+      next();
+    });
+  };
 
   // Vite dev middleware vs static production build
   let startViteAfterListen: (() => void) | null = null;
 
-  if (process.env.NODE_ENV !== 'production') {
-    const viteState: { server: ViteDevServer | null; error: Error | null } = {
-      server: null,
-      error: null,
-    };
+  if (!preferStaticDist) {
     const getViteState = () => viteState;
     let vitePromise: Promise<void> | null = null;
 
@@ -898,12 +966,18 @@ async function startServer() {
       vitePromise = import('vite')
         .then(({ createServer }) =>
           createServer({
-            server: { middlewareMode: true, hmr: false, watch: null },
+            server: {
+              middlewareMode: true,
+              hmr: false,
+              watch: null,
+              allowedHosts: true,
+            },
             appType: 'custom',
           })
         )
         .then((vite) => {
           viteState.server = vite;
+          console.log('Pheonikz UI Vite dev middleware ready');
         })
         .catch((err) => {
           viteState.error = err instanceof Error ? err : new Error(String(err));
@@ -921,18 +995,32 @@ async function startServer() {
     app.use(async (req, res, next) => {
       let current = getViteState();
       if (current.error) {
-        res.status(500).send(`Dev server initialization error: ${current.error.message}`);
+        if (hasDistBuild()) {
+          serveStaticFallback(req, res, next);
+          return;
+        }
+        res
+          .status(500)
+          .setHeader('Cache-Control', 'no-store')
+          .send(`Dev server initialization error: ${current.error.message}`);
         return;
       }
       if (!current.server) {
         await Promise.race([
           ensureVite(),
-          new Promise<void>((resolve) => setTimeout(resolve, 1500)),
+          new Promise<void>((resolve) => setTimeout(resolve, 3500)),
         ]);
         current = getViteState();
       }
       if (current.error) {
-        res.status(500).send(`Dev server initialization error: ${current.error.message}`);
+        if (hasDistBuild()) {
+          serveStaticFallback(req, res, next);
+          return;
+        }
+        res
+          .status(500)
+          .setHeader('Cache-Control', 'no-store')
+          .send(`Dev server initialization error: ${current.error.message}`);
         return;
       }
       if (current.server) {
@@ -943,8 +1031,10 @@ async function startServer() {
         res
           .status(200)
           .setHeader('Content-Type', 'text/html; charset=utf-8')
+          .setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+          .setHeader('Pragma', 'no-cache')
           .send(
-            '<!doctype html><html><head><meta http-equiv="refresh" content="2"><title>Pheonikz UI</title></head><body style="background:#0a0b08;color:#8fa85c;font-family:monospace;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">INITIALIZING PHEONIKZ UI TACTICAL NODE...</body></html>'
+            `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pheonikz UI</title></head><body style="background:#0a0b08;color:#8fa85c;font-family:monospace;display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:center;height:100vh;margin:0;padding:16px;text-align:center"><div id="status">INITIALIZING PHEONIKZ UI TACTICAL NODE...</div><div id="detail" style="color:#a8a29e;font-size:12px;max-width:460px">Warming Vite frontend middleware on server. This page will reload automatically.</div><script>(async function poll(){try{const r=await fetch('/api/health',{cache:'no-store'});const d=await r.json();if(d.viteReady){location.reload();return;}if(d.viteError){document.getElementById('status').textContent='NODE INITIALIZATION ERROR';document.getElementById('detail').textContent=d.viteError+' (Tip: run npm run build && NODE_ENV=production npm start on your VPS)';return;}}catch(e){document.getElementById('detail').textContent='Waiting for backend /api/health...';}setTimeout(poll,1500);})();</script></body></html>`
           );
         return;
       }
@@ -957,15 +1047,17 @@ async function startServer() {
       next();
     });
   } else {
-    const distDir = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distDir));
+    app.use(staticFilesMiddleware);
     app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
+      res.setHeader('Cache-Control', 'no-cache');
+      res.sendFile(distIndex);
     });
   }
 
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Pheonikz UI server listening on http://0.0.0.0:${PORT}`);
+    console.log(
+      `Pheonikz UI server listening on http://0.0.0.0:${PORT} (${preferStaticDist ? 'production static dist/' : 'dev Vite middleware'})`
+    );
     startViteAfterListen?.();
   });
 }

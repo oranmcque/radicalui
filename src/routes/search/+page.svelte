@@ -11,6 +11,7 @@
     Sparkles,
   } from 'lucide-svelte';
   import type { SearchProvider, WebSearchSource } from '../../types/index';
+  import { safeParseJson } from '#lib/uuid';
   import {
     createNewThread,
     refreshWorkspace,
@@ -48,7 +49,7 @@
   let directUrl = $state('');
 
   let activeProvider = $derived<SearchProvider>(
-    $settings?.searchProvider ?? 'gemini-native'
+    $settings.searchProvider ?? 'gemini-native'
   );
 
   const QUICK_PROBES = [
@@ -82,16 +83,19 @@
         body: JSON.stringify({
           query: q,
           provider: activeProvider,
-          maxResults: $settings?.maxSearchResults ?? 5,
+          maxResults: $settings.maxSearchResults ?? 5,
         }),
       });
-      const data = (await res.json()) as {
+      const data = await safeParseJson<{
         results?: WebSearchSource[];
         provider?: string;
         error?: string;
-      };
-      if (!res.ok) {
-        throw new Error(data.error || 'Web Recon search failed');
+      }>(res);
+      if (!res.ok || !data) {
+        throw new Error(
+          data?.error ||
+            `Search API unavailable (HTTP ${res.status}). Start the Node backend to execute live Web Recon.`
+        );
       }
       results = data.results ?? [];
       lastProvider = data.provider ?? activeProvider;
@@ -122,12 +126,14 @@
           objective: query.trim() || undefined,
         }),
       });
-      const data = (await res.json()) as {
+      const data = await safeParseJson<{
         results?: FetchedPage[];
         error?: string;
-      };
-      if (!res.ok) {
-        throw new Error(data.error || 'Page extraction failed');
+      }>(res);
+      if (!res.ok || !data) {
+        throw new Error(
+          data?.error || `Page extraction unavailable (HTTP ${res.status})`
+        );
       }
       const first = data.results?.[0];
       if (first) {
@@ -145,6 +151,7 @@
   async function handleIndexToVault(src: WebSearchSource) {
     indexingUrl = src.url;
     statusNotice = null;
+    errorMsg = null;
     try {
       const fetched = fetchedPages[src.url];
       const bodyText = fetched
@@ -162,7 +169,11 @@
       if (res.ok) {
         await refreshWorkspace();
         statusNotice = `Indexed "${src.title}" into Mnemosyne Knowledge Vault.`;
+      } else {
+        errorMsg = `Vault API unavailable (HTTP ${res.status}).`;
       }
+    } catch {
+      errorMsg = 'Unable to reach Knowledge Vault API.';
     } finally {
       indexingUrl = null;
     }
@@ -171,9 +182,9 @@
   async function handleAnalyzeInDispatch() {
     if (results.length === 0 || sendingToChat) return;
     sendingToChat = true;
+    errorMsg = null;
     try {
-      const thread = await createNewThread();
-      if (!thread) return;
+      await createNewThread();
       const summaryContext = results
         .slice(0, 5)
         .map(
@@ -186,6 +197,8 @@
         `Synthesize these live Web Recon results for "${query.trim()}" and highlight key takeaways with source citations:\n\n${summaryContext}`,
         []
       );
+    } catch (err) {
+      errorMsg = err instanceof Error ? err.message : 'Unable to send synthesis to Dispatch.';
     } finally {
       sendingToChat = false;
     }

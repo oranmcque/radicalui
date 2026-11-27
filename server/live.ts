@@ -7,15 +7,15 @@ import {
   Modality,
   Type,
 } from '@google/genai';
-import { getGeminiClient } from './ai.js';
-import { executeWebReconSearch } from './search.js';
+import { getGeminiClient } from './ai.ts';
+import { executeWebReconSearch } from './search.ts';
 import {
   addMemory,
   formatMnemosyneSystemBlock,
   loadState,
   recallMnemosyneContext,
   resolveProviderKey,
-} from './store.js';
+} from './store.ts';
 
 const recallMemoryDecl: FunctionDeclaration = {
   name: 'recall_mnemosyne_memory',

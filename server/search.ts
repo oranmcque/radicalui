@@ -1,6 +1,6 @@
-import { loadState, resolveProviderKey } from './store.js';
-import { getGeminiClient } from './ai.js';
-import type { SearchProvider, WebSearchSource } from '../src/types/index.js';
+import { loadState, resolveProviderKey } from './store.ts';
+import { getGeminiClient } from './ai.ts';
+import type { SearchProvider, WebSearchSource } from '../src/types/index.ts';
 
 const PARALLEL_MCP_ENDPOINT = 'https://mcp.parallel.ai/mcp';
 

@@ -10,13 +10,13 @@ import type {
   VaultChunk,
   VaultDocument,
   WorkspaceSettings,
-} from '../src/types/index.js';
+} from '../src/types/index.ts';
 import {
   DEFAULT_STORE_FILE,
   readLocalOrMountedStoreRaw,
   writeFileAtomic,
   writeStoreRaw,
-} from './storage.js';
+} from './storage.ts';
 
 const DEFAULT_SETTINGS: WorkspaceSettings = {
   activeProvider: 'gemini',
@@ -119,7 +119,14 @@ export function loadState(): PersistedStore {
     }
   }
   cachedState = createInitialState();
-  saveState(cachedState);
+  try {
+    saveState(cachedState);
+  } catch (err) {
+    console.warn(
+      'Initial workspace state could not be persisted to disk (continuing in-memory):',
+      err instanceof Error ? err.message : err
+    );
+  }
   return cachedState;
 }
 

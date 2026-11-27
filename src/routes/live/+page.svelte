@@ -20,6 +20,7 @@
     float32ToPcm16Base64,
   } from '#lib/audio';
   import type { MnemosyneMemory, VoicePipelineMode } from '../../types/index';
+  import { generateUUID, safeParseJson } from '#lib/uuid';
   import {
     activeThreadId,
     refreshWorkspace,
@@ -145,7 +146,7 @@
       transcript = [
         ...transcript,
         {
-          id: crypto.randomUUID(),
+          id: generateUUID(),
           role,
           text: chunk.trimStart(),
           createdAt: new Date().toISOString(),
@@ -205,7 +206,6 @@
   }
 
   async function runModularTurn(audioBlob: Blob) {
-    if (!$settings) return;
     vadState = 'processing';
     try {
       const audioBase64 = await blobToBase64(audioBlob);
@@ -218,11 +218,13 @@
           provider: $settings.sttProvider,
         }),
       });
-      const sttData = (await sttRes.json()) as {
+      const sttData = await safeParseJson<{
         transcript?: string;
         error?: string;
-      };
-      if (!sttRes.ok) throw new Error(sttData.error || 'STT failed');
+      }>(sttRes);
+      if (!sttRes.ok || !sttData) {
+        throw new Error(sttData?.error || 'STT backend unavailable.');
+      }
       const userText = (sttData.transcript || '').trim();
       if (!userText) {
         vadState = 'listening';
@@ -232,7 +234,7 @@
       transcript = [
         ...transcript,
         {
-          id: crypto.randomUUID(),
+          id: generateUUID(),
           role: 'user',
           text: userText,
           createdAt: new Date().toISOString(),
@@ -248,40 +250,44 @@
   }
 
   async function executeModularLLMAndTTS(userText: string) {
-    if (!$settings) return;
     vadState = 'processing';
-    if (!modularThreadId) {
-      const tRes = await fetch('/api/threads', {
+    try {
+      if (!modularThreadId) {
+        const tRes = await fetch('/api/threads', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            provider: $settings.activeProvider,
+            model: $settings.activeModel,
+            title: `Comms · ${new Date().toLocaleTimeString([], {
+              hour: '2-digit',
+              minute: '2-digit',
+            })}`,
+          }),
+        });
+        const tData = await safeParseJson<{ id?: string }>(tRes);
+        if (!tRes.ok || !tData?.id) {
+          throw new Error('Backend API unavailable for live voice threads.');
+        }
+        modularThreadId = tData.id;
+      }
+
+      const chatRes = await fetch('/api/chat/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          threadId: modularThreadId,
+          message: `${userText}\n\n(Note: Respond concisely as spoken voice dialogue.)`,
           provider: $settings.activeProvider,
           model: $settings.activeModel,
-          title: `Comms · ${new Date().toLocaleTimeString([], {
-            hour: '2-digit',
-            minute: '2-digit',
-          })}`,
+          useMnemosyne: true,
+          useWebSearch: $settings.useWebSearchInChat,
         }),
       });
-      const tData = (await tRes.json()) as { id: string };
-      modularThreadId = tData.id;
-    }
-
-    const chatRes = await fetch('/api/chat/stream', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        threadId: modularThreadId,
-        message: `${userText}\n\n(Note: Respond concisely as spoken voice dialogue.)`,
-        provider: $settings.activeProvider,
-        model: $settings.activeModel,
-        useMnemosyne: true,
-        useWebSearch: $settings.useWebSearchInChat,
-      }),
-    });
-    if (!chatRes.ok || !chatRes.body) {
-      throw new Error('LLM stream failed');
-    }
+      const chatContentType = chatRes.headers.get('content-type') || '';
+      if (!chatRes.ok || !chatRes.body || chatContentType.includes('text/html')) {
+        throw new Error('Backend chat stream unavailable.');
+      }
 
     const reader = chatRes.body.getReader();
     const decoder = new TextDecoder();
@@ -311,7 +317,7 @@
           } else if (ev.type === 'web_search_results' && ev.sources?.length) {
             memoryFeed = [
               {
-                id: crypto.randomUUID(),
+                id: generateUUID(),
                 action: 'search',
                 summary: `Searched web "${ev.query ?? ''}" (${ev.sources.length} hits)`,
                 timestamp: new Date().toLocaleTimeString(),
@@ -324,7 +330,7 @@
           ) {
             memoryFeed = [
               {
-                id: crypto.randomUUID(),
+                id: generateUUID(),
                 action: 'recall',
                 summary: `Recalled ${ev.recalled.memories.length} memories for context`,
                 timestamp: new Date().toLocaleTimeString(),
@@ -337,7 +343,7 @@
           ) {
             memoryFeed = [
               {
-                id: crypto.randomUUID(),
+                id: generateUUID(),
                 action: 'save',
                 summary: ev.memories[0].content,
                 timestamp: new Date().toLocaleTimeString(),
@@ -361,7 +367,7 @@
     transcript = [
       ...transcript,
       {
-        id: crypto.randomUUID(),
+        id: generateUUID(),
         role: 'assistant',
         text: assistantReply,
         createdAt: new Date().toISOString(),
@@ -378,13 +384,12 @@
         provider: $settings.ttsProvider,
       }),
     });
-    if (!ttsRes.ok) {
-      const errData = (await ttsRes.json().catch(() => ({}))) as {
-        error?: string;
-      };
+    const ttsContentType = ttsRes.headers.get('content-type') || '';
+    if (!ttsRes.ok || ttsContentType.includes('text/html')) {
+      const errData = await safeParseJson<{ error?: string }>(ttsRes);
       aiSpeaking = false;
       vadState = 'listening';
-      throw new Error(errData.error || 'TTS failed');
+      throw new Error(errData?.error || 'TTS backend unavailable.');
     }
 
     const audioBlob = await ttsRes.blob();
@@ -402,10 +407,14 @@
       URL.revokeObjectURL(url);
     };
     await audio.play();
+    } catch (err) {
+      aiSpeaking = false;
+      vadState = 'listening';
+      errorMessage = err instanceof Error ? err.message : 'Modular voice turn failed.';
+    }
   }
 
   async function startCall() {
-    if (!$settings) return;
     errorMessage = null;
     transcript = [];
     memoryFeed = [];
@@ -413,6 +422,9 @@
     callStatus = 'connecting';
 
     try {
+      if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+        throw new Error('Microphone capture requires HTTPS or localhost in this browser.');
+      }
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -442,7 +454,7 @@
         );
 
         ws.onmessage = (ev) => {
-          const msg = JSON.parse(ev.data) as {
+          let msg: {
             type: string;
             data?: string;
             text?: string;
@@ -453,6 +465,11 @@
             memory?: MnemosyneMemory;
             memories?: MnemosyneMemory[];
           };
+          try {
+            msg = JSON.parse(ev.data);
+          } catch {
+            return;
+          }
 
           if (msg.type === 'ready') {
             callStatus = 'connected';
@@ -467,7 +484,7 @@
           } else if (msg.type === 'mnemosyne_recall' && msg.memories?.length) {
             memoryFeed = [
               {
-                id: crypto.randomUUID(),
+                id: generateUUID(),
                 action: 'recall',
                 summary: `Loaded ${msg.memories.length} core & active memories`,
                 timestamp: new Date().toLocaleTimeString(),
@@ -478,7 +495,7 @@
             if (msg.action === 'recall') {
               memoryFeed = [
                 {
-                  id: crypto.randomUUID(),
+                  id: generateUUID(),
                   action: 'recall',
                   summary: `Searched "${msg.query}" (${
                     msg.memories?.length ?? 0
@@ -490,7 +507,7 @@
             } else if (msg.action === 'search') {
               memoryFeed = [
                 {
-                  id: crypto.randomUUID(),
+                  id: generateUUID(),
                   action: 'search',
                   summary: `Web search "${msg.query ?? ''}" (${
                     msg.resultsCount ?? 0
@@ -502,7 +519,7 @@
             } else if (msg.action === 'save' && msg.memory) {
               memoryFeed = [
                 {
-                  id: crypto.randomUUID(),
+                  id: generateUUID(),
                   action: 'save',
                   summary: msg.memory.content,
                   timestamp: new Date().toLocaleTimeString(),
@@ -637,13 +654,15 @@
           }),
         });
         if (res.ok) {
-          const data = (await res.json()) as { thread?: { id: string } };
+          const data = await safeParseJson<{ thread?: { id: string } }>(res);
           await refreshWorkspace();
-          if (data.thread?.id) {
+          if (data?.thread?.id) {
             activeThreadId.set(data.thread.id);
             await goto('/');
           }
         }
+      } catch {
+        errorMessage = 'Call ended locally (backend log endpoint unavailable).';
       } finally {
         savingCall = false;
       }
@@ -656,6 +675,10 @@
       return;
     }
     try {
+      if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+        errorMessage = 'Camera capture requires HTTPS or localhost in this browser.';
+        return;
+      }
       const camStream = await navigator.mediaDevices.getUserMedia({
         video: { width: 640, height: 360 },
       });
@@ -700,7 +723,7 @@
       transcript = [
         ...transcript,
         {
-          id: crypto.randomUUID(),
+          id: generateUUID(),
           role: 'user',
           text,
           createdAt: new Date().toISOString(),
@@ -711,7 +734,7 @@
       transcript = [
         ...transcript,
         {
-          id: crypto.randomUUID(),
+          id: generateUUID(),
           role: 'user',
           text,
           createdAt: new Date().toISOString(),
@@ -730,7 +753,6 @@
   }
 </script>
 
-{#if $settings}
   <div class="flex-1 overflow-y-auto px-2.5 sm:px-8 py-3 sm:py-6 bg-[#0a0b08] relative font-mono">
     <div class="absolute inset-0 pointer-events-none crt-scanlines opacity-15"></div>
 
@@ -1020,4 +1042,3 @@
       </div>
     </div>
   </div>
-{/if}

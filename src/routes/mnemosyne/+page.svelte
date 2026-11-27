@@ -13,6 +13,7 @@
     X,
   } from 'lucide-svelte';
   import type { MemoryTier, MnemosyneMemory } from '../../types/index';
+  import { generateUUID } from '#lib/uuid';
   import {
     memories,
     refreshWorkspace,
@@ -65,52 +66,103 @@
 
   async function handleCreateMemory(e: SubmitEvent) {
     e.preventDefault();
-    if (!newContent.trim() || creating) return;
+    const content = newContent.trim();
+    if (!content || creating) return;
     creating = true;
+    const tier = newTier;
+    const pinned = newPinned;
+    let synced = false;
     try {
       const res = await fetch('/api/memories', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          tier: newTier,
-          content: newContent.trim(),
-          pinned: newPinned,
-          salience: newPinned ? 0.95 : 0.75,
+          tier,
+          content,
+          pinned,
+          salience: pinned ? 0.95 : 0.75,
         }),
       });
       if (res.ok) {
-        newContent = '';
-        newPinned = false;
+        synced = true;
         await refreshWorkspace();
       }
+    } catch {
+      // Fall back to local client memory store when API is unreachable
     } finally {
+      if (!synced) {
+        const now = new Date().toISOString();
+        memories.update((prev) => [
+          {
+            id: generateUUID(),
+            tier,
+            content,
+            keywords: content
+              .toLowerCase()
+              .split(/\s+/)
+              .filter((w) => w.length > 2)
+              .slice(0, 12),
+            salience: pinned ? 0.95 : 0.75,
+            pinned,
+            sourceType: 'manual',
+            createdAt: now,
+            updatedAt: now,
+          },
+          ...prev,
+        ]);
+      }
+      newContent = '';
+      newPinned = false;
       creating = false;
     }
   }
 
   async function handleTogglePin(mem: MnemosyneMemory) {
-    await fetch(`/api/memories/${mem.id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pinned: !mem.pinned }),
-    });
-    await refreshWorkspace();
+    memories.update((prev) =>
+      prev.map((m) => (m.id === mem.id ? { ...m, pinned: !m.pinned } : m))
+    );
+    try {
+      const res = await fetch(`/api/memories/${mem.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pinned: !mem.pinned }),
+      });
+      if (res.ok) await refreshWorkspace();
+    } catch {
+      // Keep local update
+    }
   }
 
   async function handleSaveEdit(id: string) {
-    if (!editContent.trim()) return;
-    await fetch(`/api/memories/${id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: editContent.trim(), tier: editTier }),
-    });
+    const content = editContent.trim();
+    if (!content) return;
+    const tier = editTier;
+    memories.update((prev) =>
+      prev.map((m) =>
+        m.id === id ? { ...m, content, tier, updatedAt: new Date().toISOString() } : m
+      )
+    );
     editingId = null;
-    await refreshWorkspace();
+    try {
+      const res = await fetch(`/api/memories/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ content, tier }),
+      });
+      if (res.ok) await refreshWorkspace();
+    } catch {
+      // Keep local edit
+    }
   }
 
   async function handleDeleteMemory(id: string) {
-    await fetch(`/api/memories/${id}`, { method: 'DELETE' });
-    await refreshWorkspace();
+    memories.update((prev) => prev.filter((m) => m.id !== id));
+    try {
+      const res = await fetch(`/api/memories/${id}`, { method: 'DELETE' });
+      if (res.ok) await refreshWorkspace();
+    } catch {
+      // Keep local deletion
+    }
   }
 
   async function handleVaultFile(files: FileList | null) {
@@ -120,17 +172,39 @@
       for (const file of Array.from(files)) {
         const text = await file.text();
         if (!text.trim()) continue;
-        await fetch('/api/vault', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            title: file.name,
-            mimeType: file.type || 'text/plain',
-            content: text,
-          }),
-        });
+        let synced = false;
+        try {
+          const res = await fetch('/api/vault', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              title: file.name,
+              mimeType: file.type || 'text/plain',
+              content: text,
+            }),
+          });
+          if (res.ok) synced = true;
+        } catch {
+          // Offline/static fallback below
+        }
+        if (!synced) {
+          vaultDocs.update((prev) => [
+            {
+              id: generateUUID(),
+              title: file.name,
+              mimeType: file.type || 'text/plain',
+              size: text.length,
+              chunkCount: Math.max(1, Math.ceil(text.length / 800)),
+              chunks: [],
+              createdAt: new Date().toISOString(),
+            },
+            ...prev,
+          ]);
+        }
       }
       await refreshWorkspace();
+    } catch {
+      // Prevent unhandled rejection
     } finally {
       uploadingVault = false;
     }
@@ -138,31 +212,56 @@
 
   async function handlePasteVault(e: SubmitEvent) {
     e.preventDefault();
-    if (!vaultTitle.trim() || !vaultText.trim() || uploadingVault) return;
+    const title = vaultTitle.trim();
+    const content = vaultText.trim();
+    if (!title || !content || uploadingVault) return;
     uploadingVault = true;
+    let synced = false;
     try {
       const res = await fetch('/api/vault', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          title: vaultTitle.trim(),
+          title,
           mimeType: 'text/markdown',
-          content: vaultText.trim(),
+          content,
         }),
       });
       if (res.ok) {
-        vaultTitle = '';
-        vaultText = '';
+        synced = true;
         await refreshWorkspace();
       }
+    } catch {
+      // Fall back to local vault list
     } finally {
+      if (!synced) {
+        vaultDocs.update((prev) => [
+          {
+            id: generateUUID(),
+            title,
+            mimeType: 'text/markdown',
+            size: content.length,
+            chunkCount: Math.max(1, Math.ceil(content.length / 800)),
+            chunks: [],
+            createdAt: new Date().toISOString(),
+          },
+          ...prev,
+        ]);
+      }
+      vaultTitle = '';
+      vaultText = '';
       uploadingVault = false;
     }
   }
 
   async function handleDeleteVault(id: string) {
-    await fetch(`/api/vault/${id}`, { method: 'DELETE' });
-    await refreshWorkspace();
+    vaultDocs.update((prev) => prev.filter((d) => d.id !== id));
+    try {
+      const res = await fetch(`/api/vault/${id}`, { method: 'DELETE' });
+      if (res.ok) await refreshWorkspace();
+    } catch {
+      // Keep local deletion
+    }
   }
 </script>
 

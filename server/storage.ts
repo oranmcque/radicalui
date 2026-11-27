@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import type { StorageConfigPublic, StorageMode } from '../src/types/index.js';
+import type { StorageConfigPublic, StorageMode } from '../src/types/index.ts';
 
 export const DEFAULT_DATA_DIR = path.resolve(process.cwd(), 'data');
 export const DEFAULT_STORE_FILE = path.join(DEFAULT_DATA_DIR, 'aetheris-store.json');
@@ -45,8 +45,15 @@ const FORBIDDEN_SYSTEM_PREFIXES = [
 ];
 
 function ensureDefaultDataDir(): void {
-  if (!fs.existsSync(DEFAULT_DATA_DIR)) {
-    fs.mkdirSync(DEFAULT_DATA_DIR, { recursive: true });
+  try {
+    if (!fs.existsSync(DEFAULT_DATA_DIR)) {
+      fs.mkdirSync(DEFAULT_DATA_DIR, { recursive: true });
+    }
+  } catch (err) {
+    console.warn(
+      `Unable to create default data directory (${DEFAULT_DATA_DIR}):`,
+      err instanceof Error ? err.message : err
+    );
   }
 }
 
@@ -106,7 +113,14 @@ export function loadStorageConfig(): InternalStorageConfig {
 export function persistStorageConfig(cfg: InternalStorageConfig): void {
   cachedConfig = cfg;
   ensureDefaultDataDir();
-  writeFileAtomic(STORAGE_CONFIG_PATH, JSON.stringify(cfg, null, 2));
+  try {
+    writeFileAtomic(STORAGE_CONFIG_PATH, JSON.stringify(cfg, null, 2));
+  } catch (err) {
+    console.warn(
+      `Unable to persist storage config (${STORAGE_CONFIG_PATH}):`,
+      err instanceof Error ? err.message : err
+    );
+  }
 }
 
 export function validateMountedPath(rawPath: string): { ok: true; resolvedFile: string; resolvedDir: string } | { ok: false; error: string } {
