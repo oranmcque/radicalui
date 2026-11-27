@@ -24,6 +24,7 @@
     TTSProvider,
   } from '../../types/index';
   import {
+    parseJsonSafe,
     providers,
     refreshWorkspace,
     settings,
@@ -235,11 +236,18 @@
           remoteMethod: remoteMethodDraft,
         }),
       });
-      const data = (await res.json()) as {
+      const data = await parseJsonSafe<{
         ok?: boolean;
         message?: string;
         latencyMs?: number;
-      };
+      }>(res);
+      if (!data) {
+        storageFeedback = {
+          ok: false,
+          message: 'Backend server unreachable. Start with npm start or npm run preview so /api/storage/* is active.',
+        };
+        return;
+      }
       storageFeedback = {
         ok: Boolean(res.ok && data.ok),
         message: data.message || (res.ok ? 'Storage verified.' : 'Storage check failed.'),
@@ -280,18 +288,20 @@
           preferExistingOnTarget: preferExistingDraft,
         }),
       });
-      const data = (await res.json()) as {
+      const data = await parseJsonSafe<{
         config?: StorageConfigPublic;
         notice?: string;
         error?: string;
-      };
-      if (data.config) {
+      }>(res);
+      if (data?.config) {
         storageConfig.set(data.config);
       }
-      if (!res.ok) {
+      if (!res.ok || !data) {
         storageFeedback = {
           ok: false,
-          message: data.error || 'Failed to apply storage backend.',
+          message:
+            data?.error ||
+            'Backend server unreachable. Start with npm start or npm run preview to apply VPS / Hetzner storage.',
         };
         return;
       }
@@ -321,19 +331,21 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ direction }),
       });
-      const data = (await res.json()) as {
+      const data = await parseJsonSafe<{
         ok?: boolean;
         notice?: string;
         error?: string;
         config?: StorageConfigPublic;
-      };
-      if (data.config) {
+      }>(res);
+      if (data?.config) {
         storageConfig.set(data.config);
       }
-      if (!res.ok) {
+      if (!res.ok || !data) {
         storageFeedback = {
           ok: false,
-          message: data.error || `Storage ${direction} failed.`,
+          message:
+            data?.error ||
+            `Backend server unreachable. Start with npm start or npm run preview to ${direction} storage.`,
         };
         return;
       }
@@ -363,14 +375,21 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider: providerId, apiKey: keyVal }),
       });
-      if (res.ok) {
-        const data = (await res.json()) as { providers: ProviderStatus[] };
+      const data = await parseJsonSafe<{ providers?: ProviderStatus[]; error?: string }>(res);
+      if (res.ok && data?.providers) {
         providers.set(data.providers);
         keyDrafts = { ...keyDrafts, [providerId]: '' };
         keyFeedback = keyVal.trim()
           ? `${providerId.toUpperCase()} credential committed to server vault.`
           : `${providerId.toUpperCase()} vault credential cleared.`;
+      } else {
+        keyFeedback =
+          data?.error ||
+          'Backend server offline — run npm start or npm run preview to save credentials to the server vault.';
       }
+    } catch {
+      keyFeedback =
+        'Backend server offline — run npm start or npm run preview to save credentials to the server vault.';
     } finally {
       savingKeyId = null;
     }
@@ -411,12 +430,19 @@
           maxSearchResults: clampedMax,
         }),
       });
-      const data = (await res.json()) as {
+      const data = await parseJsonSafe<{
         ok?: boolean;
         message?: string;
         sampleTitle?: string;
         latencyMs?: number;
-      };
+      }>(res);
+      if (!data) {
+        reconTestResult = {
+          ok: false,
+          message: 'Backend server unreachable. Run npm start or npm run preview to test Web Recon.',
+        };
+        return;
+      }
       reconTestResult = {
         ok: Boolean(res.ok && data.ok),
         message: data.message || (res.ok ? 'Connection verified.' : 'Connection failed.'),

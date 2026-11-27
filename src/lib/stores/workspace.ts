@@ -83,9 +83,71 @@ export const activeThread = derived(
 
 let abortController: AbortController | null = null;
 let sessionSubscriptionsBound = false;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+const SETTINGS_CACHE_KEY = 'pheonikz:settings:v1';
+const MEMORIES_CACHE_KEY = 'pheonikz:memories:v1';
+const VAULT_CACHE_KEY = 'pheonikz:vault_docs:v1';
+
+export async function parseJsonSafe<T>(res: Response): Promise<T | null> {
+  try {
+    const text = await res.text();
+    if (!text || !text.trim()) return null;
+    return JSON.parse(text) as T;
+  } catch {
+    return null;
+  }
+}
+
+function readLocalCache<T>(key: string): T | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage?.getItem(key);
+    if (!raw) return null;
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+function writeLocalCache(key: string, value: unknown): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage?.setItem(key, JSON.stringify(value));
+  } catch {
+    // Ignore quota / restricted-mode localStorage errors
+  }
+}
+
+export function persistMemoriesLocally(next: MnemosyneMemory[]): void {
+  memories.set(next);
+  writeLocalCache(MEMORIES_CACHE_KEY, next);
+}
+
+export function persistVaultDocsLocally(next: VaultDocument[]): void {
+  vaultDocs.set(next);
+  writeLocalCache(VAULT_CACHE_KEY, next);
+}
+
+function scheduleReconnect(): void {
+  if (typeof window === 'undefined' || reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (!get(serverOnline)) {
+      void refreshWorkspace();
+    }
+  }, 4000);
+}
+
+function clearReconnect(): void {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
 
 /**
- * Loads previously persisted chat sessions from ChatSessionService
+ * Loads previously persisted chat sessions & cached state from local storage
  * and subscribes reactive stores to session and storage-mode updates.
  */
 export function initLocalSessions(): void {
@@ -98,6 +160,19 @@ export function initLocalSessions(): void {
     chatSessionService.subscribeStatus((status) => {
       sessionStorageStatus.set(status);
     });
+
+    const cachedSettings = readLocalCache<Partial<WorkspaceSettings>>(SETTINGS_CACHE_KEY);
+    if (cachedSettings && typeof cachedSettings === 'object') {
+      settings.set({ ...DEFAULT_SETTINGS, ...cachedSettings });
+    }
+    const cachedMemories = readLocalCache<MnemosyneMemory[]>(MEMORIES_CACHE_KEY);
+    if (Array.isArray(cachedMemories) && cachedMemories.length > 0 && get(memories).length === 0) {
+      memories.set(cachedMemories);
+    }
+    const cachedVault = readLocalCache<VaultDocument[]>(VAULT_CACHE_KEY);
+    if (Array.isArray(cachedVault) && cachedVault.length > 0 && get(vaultDocs).length === 0) {
+      vaultDocs.set(cachedVault);
+    }
   } else {
     threads.set(chatSessionService.listSessions());
     sessionStorageStatus.set(chatSessionService.getStorageStatus());
@@ -147,27 +222,39 @@ export async function refreshWorkspace(): Promise<void> {
     ]);
 
     if (provRes.ok) {
-      const provData = (await provRes.json()) as {
+      const provData = await parseJsonSafe<{
         providers: ProviderStatus[];
         models: ModelOption[];
-      };
-      providers.set(provData.providers);
-      models.set(provData.models);
+      }>(provRes);
+      if (provData) {
+        if (Array.isArray(provData.providers)) providers.set(provData.providers);
+        if (Array.isArray(provData.models)) models.set(provData.models);
+      }
     }
 
     if (storageRes && storageRes.ok) {
-      const storageData = (await storageRes.json()) as StorageConfigPublic;
-      storageConfig.set(storageData);
+      const storageData = await parseJsonSafe<StorageConfigPublic>(storageRes);
+      if (storageData && typeof storageData.mode === 'string') {
+        storageConfig.set(storageData);
+      }
     }
 
     if (!stateRes.ok) throw new Error('State unavailable');
-    const data = (await stateRes.json()) as AppStatePayload;
+    const data = await parseJsonSafe<AppStatePayload>(stateRes);
+    if (!data || !Array.isArray(data.threads) || !data.settings) {
+      throw new Error('Invalid state payload');
+    }
+
     const mergedSessions = chatSessionService.mergeSessions(data.threads);
     threads.set(mergedSessions);
     memories.set(data.memories);
     vaultDocs.set(data.vaultDocs);
-    settings.set(data.settings);
+    settings.set({ ...DEFAULT_SETTINGS, ...data.settings });
     settingsLoaded.set(true);
+
+    writeLocalCache(SETTINGS_CACHE_KEY, data.settings);
+    writeLocalCache(MEMORIES_CACHE_KEY, data.memories);
+    writeLocalCache(VAULT_CACHE_KEY, data.vaultDocs);
 
     const currentId = get(activeThreadId) ?? chatSessionService.getActiveSessionId();
     if (currentId && mergedSessions.some((t) => t.id === currentId)) {
@@ -179,24 +266,38 @@ export async function refreshWorkspace(): Promise<void> {
       chatSessionService.setActiveSessionId(nextId);
     }
     serverOnline.set(true);
+    clearReconnect();
   } catch {
     serverOnline.set(false);
+    scheduleReconnect();
   }
 }
 
 export async function updateSettings(
   updates: Partial<WorkspaceSettings>
 ): Promise<void> {
-  settings.update((prev) => ({ ...prev, ...updates }));
-  const res = await fetch('/api/settings', {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(updates),
-  });
-  if (res.ok) {
-    const saved = (await res.json()) as WorkspaceSettings;
-    settings.set(saved);
-    settingsLoaded.set(true);
+  let mergedNext = { ...get(settings), ...updates };
+  settings.set(mergedNext);
+  writeLocalCache(SETTINGS_CACHE_KEY, mergedNext);
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updates),
+    });
+    if (res.ok) {
+      const saved = await parseJsonSafe<WorkspaceSettings>(res);
+      if (saved) {
+        mergedNext = { ...DEFAULT_SETTINGS, ...saved };
+        settings.set(mergedNext);
+        writeLocalCache(SETTINGS_CACHE_KEY, mergedNext);
+        settingsLoaded.set(true);
+        serverOnline.set(true);
+        clearReconnect();
+      }
+    }
+  } catch {
+    // Setting is preserved in localStorage cache even if backend is offline
   }
 }
 

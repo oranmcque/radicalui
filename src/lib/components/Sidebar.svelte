@@ -22,6 +22,7 @@
     chatSessionService,
     type SessionStorageStatus,
   } from '#lib/services/chatSessionService';
+  import { refreshWorkspace } from '#lib/stores/workspace';
 
   interface Props {
     threads: ChatThread[];
@@ -355,7 +356,14 @@
 
   <!-- Footer Server Link & Session Storage Status -->
   <div class="border-t border-olive-drab/25 pt-2.5 mt-2.5 flex items-center justify-between text-[11px]">
-    <div class="flex items-center gap-2">
+    <button
+      type="button"
+      onclick={() => void refreshWorkspace()}
+      title={serverOnline
+        ? 'Connected to Pheonikz backend (click to refresh)'
+        : 'Backend unreachable — click to reconnect (or run npm start / npm run preview)'}
+      class="flex items-center gap-2 cursor-pointer hover:opacity-85 transition-opacity"
+    >
       <span
         class="inline-block w-2 h-2 rounded-full {serverOnline
           ? 'bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.6)]'
@@ -368,7 +376,7 @@
       >
         {serverOnline ? 'Server: Online' : 'Server: Offline'}
       </span>
-    </div>
+    </button>
     <span
       title={effectiveStatus.mode === 'memory'
         ? effectiveStatus.fallbackReason || 'Memory-only fallback active'

@@ -10,7 +10,7 @@
     "dev": "tsx server.ts",
     "start": "node server.ts",
     "build": "vite build",
-    "preview": "vite preview",
+    "preview": "tsx server.ts --static --port 4173",
     "prepare": "svelte-kit sync || echo ''",
     "clean": "rm -rf dist .svelte-kit server.js",
     "lint": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && tsc --noEmit"

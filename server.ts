@@ -66,7 +66,28 @@ import {
   type VaultKeyProvider,
 } from './server/store.ts';
 
-const PORT = Number(process.env.PORT) || 3000;
+function parseCliArg(flag: string, shortFlag?: string): string | undefined {
+  const args = process.argv.slice(2);
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === flag || (shortFlag && arg === shortFlag)) {
+      return args[i + 1];
+    }
+    if (arg.startsWith(`${flag}=`)) {
+      return arg.slice(flag.length + 1);
+    }
+  }
+  return undefined;
+}
+
+const cliPort = parseCliArg('--port', '-p');
+const cliHost = parseCliArg('--host');
+const cliStatic = process.argv.includes('--static');
+const cliDev = process.argv.includes('--dev');
+const isRunningUnderTsx = process.execArgv.some((a) => a.includes('tsx'));
+
+const PORT = Number(cliPort || process.env.PORT) || 3000;
+const HOST = cliHost || process.env.HOST || '0.0.0.0';
 
 async function startServer() {
   const app = express();
@@ -79,7 +100,11 @@ async function startServer() {
   const distIndex = path.join(distDir, 'index.html');
   const hasDistBuild = () => fs.existsSync(distIndex);
   const preferStaticDist =
-    (process.env.NODE_ENV === 'production' || process.env.SERVE_STATIC === 'true') &&
+    !cliDev &&
+    (cliStatic ||
+      process.env.NODE_ENV === 'production' ||
+      process.env.SERVE_STATIC === 'true' ||
+      !isRunningUnderTsx) &&
     hasDistBuild();
 
   const viteState: { server: ViteDevServer | null; error: Error | null } = {
@@ -1054,9 +1079,9 @@ async function startServer() {
     });
   }
 
-  server.listen(PORT, '0.0.0.0', () => {
+  server.listen(PORT, HOST, () => {
     console.log(
-      `Pheonikz UI server listening on http://0.0.0.0:${PORT} (${preferStaticDist ? 'production static dist/' : 'dev Vite middleware'})`
+      `Pheonikz UI server listening on http://${HOST}:${PORT} (${preferStaticDist ? 'static dist/ + Express API' : 'dev Vite middleware + Express API'})`
     );
     startViteAfterListen?.();
   });
